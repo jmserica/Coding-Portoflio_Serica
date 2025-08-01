@@ -1,0 +1,23 @@
+import pandas as pd
+from fbprophet import Prophet
+
+# 1. Load historical monthly MQL-to-Close conversion rates
+df = pd.read_csv('conv_rates.csv', parse_dates=['ds'])
+df.rename(columns={'rate':'y'}, inplace=True)
+
+# 2. Initialize and fit model
+m = Prophet(
+    yearly_seasonality=True,
+    weekly_seasonality=False,
+    daily_seasonality=False
+)
+m.fit(df)
+
+# 3. Make future dataframe and predict
+future = m.make_future_dataframe(periods=6, freq='M')
+forecast = m.predict(future)
+
+# 4. Extract and display forecast
+pred = forecast[['ds','yhat','yhat_lower','yhat_upper']].tail(6)
+print("6-Month Conversion Rate Forecast:")
+print(pred.to_string(index=False))
