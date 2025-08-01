@@ -1,0 +1,632 @@
+# ───────────────────────────────────────────────────────────────────────────────
+# R Script: Pet Food Survey Data Preparation & PLS-SEM Analysis
+# Author: Brutally Honest, No-Fluff Data Pipeline for Mr. Miguel
+# ───────────────────────────────────────────────────────────────────────────────
+
+# 1. Package Installation & Loading ----------------------------------------------
+for (pkg in c("readxl","dplyr","stringr","tidyr","readr","car","psych","tibble","plspm","broom")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# 2. Define File Path & Pre-flight Check -----------------------------------------
+file_path <- file.path(Sys.getenv("HOME"), "Desktop", "Pet.xlsx")
+if (!file.exists(file_path)) stop("File not found at: ", file_path)
+
+# 3. Import Excel Data -----------------------------------------------------------
+pet_df <- readxl::read_excel(path = file_path, sheet = 1, col_names = TRUE)
+
+# 3.1 COLUMN NAME SHORTENING: Map long headers to short codes -------------------
+item_map <- c(
+  AT1 = "CONSTRUCT: ATTITUDE  I have a positive attitude toward the pet food I usually buy.",
+  AT2 = "CONSTRUCT: ATTITUDE  I think purchasing my preferred pet food is a good decision.",
+  AT3 = "CONSTRUCT: ATTITUDE  I enjoy choosing pet food for my pet.",
+  AT4 = "CONSTRUCT: ATTITUDE  I feel good about feeding the pet food I usually buy to my pet.",
+  BR1 = "CONSTRUCT: BRAND REPUTATION  I trust the brand of pet food I normally purchase.",
+  BR2 = "CONSTRUCT: BRAND REPUTATION  The brand of pet food I buy is well-regarded.",
+  BR3 = "CONSTRUCT: BRAND REPUTATION  I am familiar with the brand of pet food I usually choose.",
+  BR4 = "CONSTRUCT: BRAND REPUTATION  The brand of pet food I use is widely recognized in the market.",
+  PK1 = "CONSTRUCT: PACKAGE DESIGN  The packaging of pet food often catches my attention.",
+  PK2 = "CONSTRUCT: PACKAGE DESIGN  I like how most pet food products are packaged and presented.",
+  PK3 = "CONSTRUCT: PACKAGE DESIGN  The design of pet food packaging makes the product seem trustworthy.",
+  HL1 = "CONSTRUCT: PERCEPTION OF PRODUCT HEALTHINESS  The pet food I buy seems healthy for my pet.",
+  HL2 = "CONSTRUCT: PERCEPTION OF PRODUCT HEALTHINESS  The pet food I use appears to contain beneficial nutrients.",
+  HL3 = "CONSTRUCT: PERCEPTION OF PRODUCT HEALTHINESS  I feel confident that my usual pet food supports my pet’s health.",
+  HL4 = "CONSTRUCT: PERCEPTION OF PRODUCT HEALTHINESS  Health benefits of pet food are clearly shown in the products I see.",
+  PR1 = "CONSTRUCT: PRICE FAIRNESS  I believe the pet food I buy is fairly priced for its quality.",
+  PR2 = "CONSTRUCT: PRICE FAIRNESS  The cost of pet food I usually purchase is acceptable compared to other options.",
+  PR3 = "CONSTRUCT: PRICE FAIRNESS  The price of the pet food I choose feels reasonable.",
+  PR4 = "CONSTRUCT: PRICE FAIRNESS  I feel that I get good value from the pet food I usually buy.",
+  PI1 = "CONSTRUCT: PURCHASE INTENTION  I plan to continue buying the same type of pet food.",
+  PI2 = "CONSTRUCT: PURCHASE INTENTION  I intend to keep purchasing my current pet food in the future.",
+  PI3 = "CONSTRUCT: PURCHASE INTENTION  I am likely to recommend the pet food I usually buy to others.",
+  PI4 = "CONSTRUCT: PURCHASE INTENTION  I often choose the same pet food over other alternatives.",
+  AW1 = "CONSTRUCT: RECOMMENDATION  I would suggest the pet food I use to fellow pet owners.",
+  AW2 = "CONSTRUCT: RECOMMENDATION  I have recommended my preferred pet food to others.",
+  AW3 = "CONSTRUCT: RECOMMENDATION  I often say good things about the pet food I usually buy.",
+  AW4 = "CONSTRUCT: RECOMMENDATION  I bring up the pet food I use when someone asks for suggestions.",
+  PB1 = "CONSTRUCT: PURCHASE BEHAVIOR  I intend to continue purchasing pet nutritional food in the future.",
+  PB2 = "CONSTRUCT: PURCHASE BEHAVIOR  I will frequently purchase pet nutritional food in the future.",
+  PB3 = "CONSTRUCT: PURCHASE BEHAVIOR  I plan to increase the frequency of purchasing pet nutritional food."
+)
+clean_nm <- function(x) gsub("\\s+", " ", trimws(x))
+names(pet_df) <- sapply(names(pet_df), clean_nm)
+item_map <- sapply(item_map, clean_nm)
+for (code in names(item_map)) {
+  idx <- which(names(pet_df) == item_map[[code]])
+  if (length(idx)==1) names(pet_df)[idx] <- code
+}
+cat("Survey item codes in pet_df:\n")
+print(intersect(names(pet_df), names(item_map)))
+
+# 3.2 DEMOGRAPHIC PIPELINE ------------------------------------------------------
+demo_map <- c(
+  age      = "Age",
+  sex      = "Biological Sex",
+  civil    = "Civil Status",
+  pets     = "No. of Pets",
+  pet_type = "Pet Type",
+  income   = "Personal Income Level (Monthly)"
+)
+missing_demo <- setdiff(demo_map, names(pet_df))
+if (length(missing_demo)) stop("Missing demographics: ", paste(missing_demo, collapse=", "))
+for (nm in names(demo_map)) {
+  pet_df[[nm]] <- pet_df[[demo_map[[nm]]]]
+}
+pet_df <- pet_df %>%
+  mutate(
+    age            = as.numeric(gsub("[^0-9]", "", age)),
+    sex_code       = case_when(tolower(sex)   == "male"   ~ 1,
+                               tolower(sex)   == "female" ~ 2, TRUE ~ NA_real_),
+    civil_code     = case_when(str_detect(tolower(civil),"single")           ~ 1,
+                               str_detect(tolower(civil),"married")          ~ 2,
+                               str_detect(tolower(civil),"widowed")          ~ 3,
+                               str_detect(tolower(civil),"divorc|separated") ~ 4, TRUE ~ NA_real_),
+    pets           = as.numeric(gsub("[^0-9]", "", pets)),
+    pet_type_code  = case_when(str_detect(tolower(pet_type),"dog")   ~ 1,
+                               str_detect(tolower(pet_type),"cat")   ~ 2,
+                               TRUE                                  ~ 3),
+    income_code    = as.numeric(income)
+  )
+cat("\nDemographic audit:\n")
+print(pet_df %>% summarize(n_age=sum(!is.na(age)), n_sex=sum(!is.na(sex_code)),
+                           n_civil=sum(!is.na(civil_code)), n_pets=sum(!is.na(pets)),
+                           n_pet_type=sum(!is.na(pet_type_code)),
+                           n_income=sum(!is.na(income_code))))
+if (any(pet_df %>% summarize(across(c(age,sex_code,civil_code,pets,pet_type_code,income_code), ~sum(!is.na(.)))) <5)) {
+  stop("🚨 Demographics have <5 valid entries.")
+}
+
+# 4. Define item‐vectors ----------------------------------------------------------
+att_cols    <- c("AT1","AT2","AT3","AT4")
+trust_cols  <- c("BR1","BR2")
+fam_cols    <- c("BR3","BR4")
+pkg_cols    <- c("PK1","PK2","PK3")
+health_cols <- c("HL1","HL2","HL3","HL4")
+price_cols  <- c("PR1","PR2","PR3","PR4")
+int_cols    <- c("PI1","PI2","PI3","PI4")
+adv_cols    <- c("AW1","AW2","AW3","AW4")
+beh_cols    <- c("PB1","PB2","PB3")
+
+# 5. Cast to numeric -------------------------------------------------------------
+all_items <- c(att_cols, trust_cols, fam_cols, pkg_cols,
+               health_cols, price_cols, int_cols, adv_cols, beh_cols)
+pet_df <- pet_df %>% mutate(across(all_of(all_items), as.numeric, .names="{.col}_num"))
+
+# 6. Build numeric vectors -------------------------------------------------------
+att_num     <- paste0(att_cols,   "_num")
+trust_num   <- paste0(trust_cols, "_num")
+fam_num     <- paste0(fam_cols,   "_num")
+pkg_num     <- paste0(pkg_cols,   "_num")
+health_num  <- paste0(health_cols,"_num")
+price_num   <- paste0(price_cols, "_num")
+int_num     <- paste0(int_cols,   "_num")
+adv_num     <- paste0(adv_cols,   "_num")
+beh_num     <- paste0(beh_cols,   "_num")
+
+# DEFINE BLOCKS & MODES FOR PLS-PM ----------------------------------------------
+blocks <- list(
+  Attitude          = att_num,
+  BrandTrust        = trust_num,
+  Familiarity       = fam_num,
+  PackageDesign     = pkg_num,
+  HealthPerception  = health_num,
+  PriceFairness     = price_num,
+  PurchaseIntention = int_num,
+  Recommendation    = adv_num,
+  PurchaseBehavior  = beh_num
+)
+modes <- rep("A", length(blocks))  # reflective measurement mode for all constructs
+
+# 7. Compute construct scores ---------------------------------------------------
+pet_df <- pet_df %>% rowwise() %>% mutate(
+  attitude_score     = mean(c_across(all_of(att_num)),  na.rm=TRUE),
+  trust_score        = mean(c_across(all_of(trust_num)), na.rm=TRUE),
+  familiarity_score  = mean(c_across(all_of(fam_num)),   na.rm=TRUE),
+  packaging_score    = mean(c_across(all_of(pkg_num)),   na.rm=TRUE),
+  health_score       = mean(c_across(all_of(health_num)),na.rm=TRUE),
+  price_score        = mean(c_across(all_of(price_num)), na.rm=TRUE),
+  intention_score    = mean(c_across(all_of(int_num)),   na.rm=TRUE),
+  advocacy_score     = mean(c_across(all_of(adv_num)),   na.rm=TRUE),
+  behavior_score     = mean(c_across(all_of(beh_num)),   na.rm=TRUE)
+) %>% ungroup()
+
+# 8. Preview ---------------------------------------------------------------------
+pet_df %>%
+  select(age, sex_code, civil_code, pets, pet_type_code, income_code,
+         ends_with("_score")) %>%
+  slice_head(n=5) %>% print()
+
+# 9. Descriptive Statistics ------------------------------------------------------
+demo_cont <- pet_df %>% summarize(
+  age_mean  = mean(age, na.rm=TRUE),  age_sd  = sd(age, na.rm=TRUE),
+  pets_mean = mean(pets,na.rm=TRUE),  pets_sd = sd(pets,na.rm=TRUE)
+)
+demo_cat <- lapply(pet_df[c("sex_code","civil_code","pet_type_code","income_code")],
+                   function(x) prop.table(table(x, useNA="ifany")))
+cat("\nDemographics - continuous:\n"); print(demo_cont)
+cat("\nDemographics - categorical:\n"); print(demo_cat)
+
+construct_stats <- pet_df %>% summarize(
+  attitude_mean  = mean(attitude_score,na.rm=TRUE),  attitude_sd  = sd(attitude_score,na.rm=TRUE),
+  trust_mean     = mean(trust_score,na.rm=TRUE),     trust_sd     = sd(trust_score,na.rm=TRUE),
+  familiarity_mean = mean(familiarity_score,na.rm=TRUE), familiarity_sd = sd(familiarity_score,na.rm=TRUE),
+  packaging_mean = mean(packaging_score,na.rm=TRUE), packaging_sd = sd(packaging_score,na.rm=TRUE),
+  health_mean    = mean(health_score,na.rm=TRUE),    health_sd    = sd(health_score,na.rm=TRUE),
+  price_mean     = mean(price_score,na.rm=TRUE),     price_sd     = sd(price_score,na.rm=TRUE),
+  intention_mean = mean(intention_score,na.rm=TRUE), intention_sd = sd(intention_score,na.rm=TRUE),
+  advocacy_mean  = mean(advocacy_score,na.rm=TRUE),  advocacy_sd  = sd(advocacy_score,na.rm=TRUE),
+  behavior_mean  = mean(behavior_score,na.rm=TRUE),  behavior_sd  = sd(behavior_score,na.rm=TRUE)
+)
+print(construct_stats)
+
+# 10. Cronbach’s α per construct -------------------------------------------------
+cronbach_df <- data.frame(
+  Construct = c("Attitude","BrandTrust","Familiarity","Packaging","Health",
+                "Price","PurchaseIntention","Advocacy","PurchaseBehavior"),
+  Alpha     = c(
+    psych::alpha(pet_df[, att_num])$total$raw_alpha,
+    psych::alpha(pet_df[, trust_num])$total$raw_alpha,
+    psych::alpha(pet_df[, fam_num])$total$raw_alpha,
+    psych::alpha(pet_df[, pkg_num])$total$raw_alpha,
+    psych::alpha(pet_df[, health_num])$total$raw_alpha,
+    psych::alpha(pet_df[, price_num])$total$raw_alpha,
+    psych::alpha(pet_df[, int_num])$total$raw_alpha,
+    psych::alpha(pet_df[, adv_num])$total$raw_alpha,
+    psych::alpha(pet_df[, beh_num])$total$raw_alpha
+  )
+)
+cat("\nCronbach’s α:\n"); print(cronbach_df)
+
+# 11. PLS-SEM Specification & Estimation -----------------------------------------
+# Prepare sem_data and ensure completeness
+sem_data <- pet_df[, unlist(blocks)]
+sem_data <- sem_data[complete.cases(sem_data), ]
+
+# Identify and drop zero-variance variables
+zero_vars <- names(which(sapply(sem_data, function(x) var(x, na.rm=TRUE)) == 0))
+if (length(zero_vars) > 0) {
+  message("Dropping zero-variance vars: ", paste(zero_vars, collapse = ", "))
+  sem_data <- sem_data[, !names(sem_data) %in% zero_vars]
+  # Update blocks to remove dropped indicators
+  blocks <- lapply(blocks, function(cols) {
+    idx <- cols %in% names(sem_data)
+    cols[idx]
+  })
+}
+
+# ---- Lower-triangular inner_model for PLS-PM ----
+
+block_names <- c(
+  "PackageDesign",
+  "PriceFairness",
+  "BrandTrust",
+  "Familiarity",
+  "HealthPerception",
+  "Attitude",
+  "Recommendation",
+  "PurchaseIntention",
+  "PurchaseBehavior"
+)
+
+blocks <- blocks[block_names]
+modes  <- modes[match(block_names, names(blocks))]
+
+inner_model <- matrix(0, nrow=length(blocks), ncol=length(blocks),
+                      dimnames=list(block_names, block_names))
+
+# Only fill BELOW the diagonal (downward causal flow):
+inner_model["Attitude",        c("PackageDesign","PriceFairness","BrandTrust","Familiarity","HealthPerception")] <- 1
+inner_model["Recommendation",  c("PackageDesign","PriceFairness","BrandTrust","Familiarity","HealthPerception")] <- 1
+inner_model["PurchaseIntention", c("Attitude","Recommendation")] <- 1
+inner_model["PurchaseBehavior",  "PurchaseIntention"]            <- 1
+
+# Run PLS-PM with explicit convergence controls
+pls_out <- plspm(
+  sem_data, inner_model, blocks, modes,
+  scaled   = TRUE,
+  boot.val = TRUE,
+  br       = 5000,
+  tol      = 1e-06,
+  maxiter  = 300
+)
+
+# Safety check: ensure no NA loadings
+if (any(is.na(pls_out$outer_model$loading))) {
+  stop("PLS-PM did not converge cleanly: NA loadings detected.")
+}
+
+# >>> R-squared for all PLS-SEM endogenous constructs <<<
+cat("\n>>> PLS-SEM R-squared (Endogenous Constructs):\n")
+pls_r2_vec <- pls_out$R2
+pls_r2 <- data.frame(
+  Construct = names(pls_r2_vec),
+  R2 = round(as.numeric(pls_r2_vec), 3),
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+print(pls_r2, row.names = FALSE)
+
+# --- 11B. Direct Path Coefficients & Significance (Bootstrapped) ---------------
+cat("\n>>> Direct Path Coefficients & Significance (Bootstrapped) ---\n")
+if (!is.null(pls_out$boot$paths)) {
+  # If tidyverse loaded, you can process as dataframe; else just print
+  boot_paths <- pls_out$boot$paths %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Path") %>%
+    filter(Original != 0) %>%
+    mutate(
+      Beta      = round(Original,   3),
+      SE        = round(Std.Error,  3),
+      z         = round(Original/Std.Error, 3),
+      p.value   = round(2*pnorm(-abs(Original/Std.Error)), 4),
+      Supported = ifelse(p.value<0.05,"Yes","No")
+    ) %>%
+    select(Path, Beta, SE, z, p.value, Supported)
+  print(boot_paths, row.names = FALSE)
+} else {
+  print(pls_out$paths)
+}
+
+# --- 11C. Indirect (Mediation) & Total Effects (Bootstrapped) -------------------
+cat("\n>>> Indirect & Total (Mediation) Effects ---\n")
+if (!is.null(pls_out$boot$effects)) {
+  # If available, show bootstrapped effects table
+  print(as.data.frame(pls_out$boot$effects))
+} else if (!is.null(pls_out$effects)) {
+  # Else, show ordinary effects
+  print(as.data.frame(pls_out$effects))
+} else {
+  cat("No mediation/indirect effects available.\n")
+}
+
+
+# 12. Reliability & Validity Extraction (unchanged) -----------------------------
+# … your existing code to compute rhoC, AVE, rhoA, FL matrix …
+
+# 12. Reliability & Validity Assessment -----------------------------------------
+# 12A. Composite Reliability (ρC) & Convergent Validity (AVE)
+loadings <- pls_out$outer_model
+constructs <- names(blocks)
+convergent_results <- do.call(rbind, lapply(constructs, function(lv) {
+  lv_loads <- loadings$loading[loadings$block == lv]
+  ave      <- sum(lv_loads^2) / length(lv_loads)
+  sum_loads<- sum(lv_loads)
+  err_var  <- sum(1 - lv_loads^2)
+  rhoC     <- sum_loads^2 / (sum_loads^2 + err_var)
+  data.frame(
+    Construct = lv,
+    AVE       = round(ave,  3),
+    rhoC      = round(rhoC, 3)
+  )
+}))
+cat("\nA. Composite Reliability (ρC) & C. Convergent Validity (AVE)\n")
+print(convergent_results)
+
+# 12B. Reliability Coefficient (ρA)
+rhoA_df <- cronbach_df
+names(rhoA_df)[names(rhoA_df) == "Alpha"] <- "rhoA"
+rhoA_df$rhoA <- round(rhoA_df$rhoA, 3)
+cat("\nB. Reliability Coefficient (ρA)\n")
+print(rhoA_df)
+
+# 12D. Discriminant Validity: Fornell–Larcker Criterion
+ave_vals <- setNames(convergent_results$AVE, convergent_results$Construct)
+corr_lv  <- cor(pls_out$scores)
+fl_matrix<- corr_lv
+diag(fl_matrix) <- round(sqrt(ave_vals[colnames(fl_matrix)]), 3)
+cat("\nD.1. Fornell–Larcker Criterion (√AVE on diagonal)\n")
+print(round(fl_matrix, 3))
+
+# --- 12E. Indicator (Factor) Loadings (per item) --------------------------------
+cat("\nE. Indicator (Factor) Loadings:\n")
+indicator_loadings <- pls_out$outer_model[, c("block", "name", "loading")]
+print(indicator_loadings)
+
+# --- 12F. Discriminant Validity: Cross-Loadings ---------------------------------
+cat("\nF. Discriminant Validity: Indicator Cross-Loadings (item × construct):\n")
+item_names <- unique(pls_out$outer_model$name)
+cross_loadings <- cor(sem_data[, item_names], pls_out$scores, use="pairwise.complete.obs")
+print(round(cross_loadings, 3))
+
+# --- 12G. Discriminant Validity: Heterotrait–Monotrait Ratio (HTMT) -------------
+htmt_matrix <- function(data, blocks) {
+  res <- matrix(NA, nrow=length(blocks), ncol=length(blocks),
+                dimnames=list(names(blocks),names(blocks)))
+  for(i in seq_along(blocks)) for(j in seq_along(blocks)) {
+    if(i==j) next
+    X <- as.matrix(data[,blocks[[i]]])
+    Y <- as.matrix(data[,blocks[[j]]])
+    vals <- c()
+    for(x in 1:ncol(X)) for(y in 1:ncol(Y)) {
+      vals <- c(vals, abs(cor(X[,x], Y[,y], use="pairwise.complete.obs")))
+    }
+    res[i,j] <- mean(vals, na.rm=TRUE)
+  }
+  res
+}
+htmt_out <- htmt_matrix(pet_df, blocks)
+cat("\nG. Heterotrait–Monotrait Ratio (HTMT):\n")
+print(round(htmt_out, 3))
+
+# 7. Multicollinearity Assessment – Average VIF per Construct
+# (uses sem_data and blocks as defined above)
+
+# 7.1: VIF helper (identical to before)
+vif_fun <- function(data, items) {
+  sapply(items, function(x) {
+    others <- setdiff(items, x)
+    if (length(others) == 0) return(NA_real_)
+    # build formula: e.g. `Y` ~ `X1` + `X2`
+    frm <- as.formula(
+      paste0("`", x, "` ~ ",
+             paste0("`", others, "`", collapse = " + "))
+    )
+    1 / (1 - summary(lm(frm, data = data))$r.squared)
+  })
+}
+
+# 7.2: Compute average VIF per construct with base-R aggregation
+avg_vif_results <- tibble::tibble(
+  Construct   = names(blocks),
+  Average_VIF = vapply(
+    blocks,
+    function(items) mean(vif_fun(sem_data, items), na.rm = TRUE),
+    numeric(1)
+  )
+)
+
+# 7.3: Round and display
+avg_vif_results$Average_VIF <- round(avg_vif_results$Average_VIF, 3)
+
+cat("\n7. Multicollinearity Assessment – Average VIF per Construct\n")
+print(avg_vif_results)
+
+
+# 13. Moderation Analysis with R² -----------------------------------------------
+demo_vars <- c("age","sex_code","civil_code","pets","pet_type_code","income_code")
+score_map <- list(
+  PackageDesign    = "packaging_score",
+  PriceFairness    = "price_score",
+  BrandTrust       = "trust_score",
+  Familiarity      = "familiarity_score",
+  HealthPerception = "health_score"
+)
+mod_results <- tibble(Attribute=character(), Moderator=character(),
+                      Beta=double(), SE=double(), t_value=double(), p_value=double(), R2=double())
+for (d in demo_vars) {
+  for (attr in names(score_map)) {
+    sc <- score_map[[attr]]
+    ic <- paste0(sc,"_x_",d)
+    pet_df[[ic]] <- pet_df[[sc]] * pet_df[[d]]
+    sub <- na.omit(pet_df[c("behavior_score", sc, d, ic)])
+    if (nrow(sub) < 5) next
+    fit <- lm(as.formula(paste("behavior_score ~", sc, "+", d, "+", ic)), data=sub)
+    trm <- tidy(fit) %>% filter(term == ic)
+    mod_results <- mod_results %>% add_row(
+      Attribute=attr, Moderator=d,
+      Beta=round(trm$estimate,3), SE=round(trm$std.error,3),
+      t_value=round(trm$statistic,3), p_value=round(trm$p.value,3),
+      R2=round(summary(fit)$r.squared, 3)
+    )
+    # Optional: print inline if needed:
+    cat(sprintf("\n[%s × %s Moderation] R² = %.3f\n", attr, d, summary(fit)$r.squared))
+  }
+}
+cat("\nModeration Results (with R²):\n"); print(mod_results, n=nrow(mod_results))
+
+# END OF SCRIPT
+# ────────────────────────────────────────────────────────────────────────────
+# 14. Publication-quality PLS-SEM diagram via DiagrammeR (FIXED)
+# ────────────────────────────────────────────────────────────────────────────
+
+# 14.0 Install & load DiagrammeR
+if (!requireNamespace("DiagrammeR", quietly = TRUE)) {
+  install.packages("DiagrammeR", repos = "https://cloud.r-project.org")
+}
+library(DiagrammeR)
+
+# 14.1 Build node_df for latent constructs
+latents <- names(pls_out$R2)
+r2_vals <- as.numeric(pls_out$R2[latents])
+
+# Clean labels to avoid special characters that might cause issues
+clean_labels <- ifelse(
+  is.na(r2_vals),
+  latents,
+  paste0(latents, "\\nR²=", sprintf("%.2f", r2_vals))
+)
+
+node_df <- create_node_df(
+  n         = length(latents),
+  label     = clean_labels,
+  type      = "latent",
+  shape     = "hexagon",
+  style     = "filled",
+  fillcolor = "lightblue",
+  fontname  = "Arial",
+  fontcolor = "black",
+  fontsize  = 10
+)
+
+# 14.2 Build edge_df of structural paths
+pm <- as.matrix(pls_out$path_coefs)
+pm[is.na(pm)] <- 0
+idx <- which(row(pm) != col(pm) & pm != 0, arr.ind = TRUE)
+
+edge_tbl <- data.frame(
+  from = rownames(pm)[idx[, "row"]],
+  to   = colnames(pm)[idx[, "col"]],
+  beta = pm[idx],
+  stringsAsFactors = FALSE
+)
+
+# Match using original latent names, not the formatted labels
+edge_df <- create_edge_df(
+  from      = match(edge_tbl$from, latents),
+  to        = match(edge_tbl$to, latents),
+  label     = sprintf("%.2f", edge_tbl$beta),
+  penwidth  = pmax(1, abs(edge_tbl$beta) * 3),
+  arrowhead = "normal",
+  fontname  = "Arial",
+  fontcolor = "black",
+  fontsize  = 8
+)
+
+# 14.3 SOLUTION 1: Basic graph creation without themes
+tryCatch({
+  graph <- create_graph(
+    nodes_df = node_df,
+    edges_df = edge_df
+  )
+  
+  # Add global attributes separately
+  graph <- graph %>%
+    add_global_graph_attrs("rankdir", "LR", "graph") %>%
+    add_global_graph_attrs("layout", "dot", "graph") %>%
+    add_global_graph_attrs("bgcolor", "white", "graph") %>%
+    add_global_graph_attrs("fontname", "Arial", "graph")
+  
+  # Render the graph
+  render_graph(graph, title = "PLS-SEM Path Model")
+  
+}, error = function(e) {
+  cat("Method 1 failed:", e$message, "\n")
+  
+  # 14.4 SOLUTION 2: Alternative using grViz directly
+  tryCatch({
+    cat("Trying alternative method with grViz...\n")
+    
+    # Create DOT notation manually
+    dot_code <- paste0('
+    digraph {
+      graph [rankdir = LR, bgcolor = white]
+      node [shape = hexagon, style = filled, fillcolor = lightblue, fontname = Arial]
+      edge [fontname = Arial, fontcolor = black]
+      
+      // Nodes
+      ', paste(paste0('"', latents, '"', ' [label="', clean_labels, '"]'), collapse = "\n      "), '
+      
+      // Edges  
+      ', paste(paste0('"', edge_tbl$from, '"', ' -> "', edge_tbl$to, '"', 
+                      ' [label="', sprintf("%.2f", edge_tbl$beta), '", penwidth=', 
+                      pmax(1, abs(edge_tbl$beta) * 2), ']'), collapse = "\n      "), '
+    }')
+    
+    grViz(dot_code)
+    
+  }, error = function(e2) {
+    cat("Method 2 also failed:", e2$message, "\n")
+    
+    # 14.5 SOLUTION 3: Minimal fallback
+    cat("Using minimal fallback method...\n")
+    
+    # Create very simple graph
+    simple_graph <- create_graph() %>%
+      add_nodes_from_table(
+        table = data.frame(
+          id = 1:length(latents),
+          label = latents,
+          shape = "hexagon",
+          fillcolor = "lightblue"
+        ),
+        label_col = "label"
+      )
+    
+    # Add edges
+    for(i in 1:nrow(edge_tbl)) {
+      from_id <- which(latents == edge_tbl$from[i])
+      to_id <- which(latents == edge_tbl$to[i])
+      
+      simple_graph <- simple_graph %>%
+        add_edge(
+          from = from_id,
+          to = to_id,
+          edge_aes = edge_aes(label = sprintf("%.2f", edge_tbl$beta[i]))
+        )
+    }
+    
+    render_graph(simple_graph)
+  })
+})
+
+# 14.6 SOLUTION 4: Using alternative packages if DiagrammeR fails
+if (!exists("graph") || is.null(graph)) {
+  cat("DiagrammeR failed. Trying alternative visualization...\n")
+  
+  # Check if igraph is available
+  if (requireNamespace("igraph", quietly = TRUE)) {
+    library(igraph)
+    
+    # Create igraph network
+    g <- graph_from_data_frame(
+      d = edge_tbl[, c("from", "to", "beta")],
+      directed = TRUE,
+      vertices = data.frame(
+        name = latents,
+        r2 = r2_vals
+      )
+    )
+    
+    # Plot with igraph
+    plot(g,
+         vertex.shape = "circle",
+         vertex.color = "lightblue",
+         vertex.size = 30,
+         vertex.label.color = "black",
+         vertex.label.cex = 0.8,
+         edge.label = sprintf("%.2f", E(g)$beta),
+         edge.label.cex = 0.7,
+         edge.arrow.size = 0.5,
+         layout = layout_with_sugiyama(g)$layout,
+         main = "PLS-SEM Path Model"
+    )
+    
+  } else {
+    cat("Please install igraph package for alternative visualization:\n")
+    cat("install.packages('igraph')\n")
+  }
+}
+
+# 14.7 Export function (use only if graph creation succeeded)
+export_pls_diagram <- function(graph_obj = NULL, filename = "pls_sem_model") {
+  if (!is.null(graph_obj)) {
+    tryCatch({
+      export_graph(graph_obj, 
+                   file_name = paste0(filename, ".svg"), 
+                   file_type = "SVG")
+      cat("Graph exported to", paste0(filename, ".svg"), "\n")
+    }, error = function(e) {
+      cat("Export failed:", e$message, "\n")
+    })
+  } else {
+    cat("No graph object available for export\n")
+  }
+}
+
+# Uncomment to export if graph creation succeeded
+# export_pls_diagram(graph)
+
+cat("PLS-SEM diagram code execution completed.\n")

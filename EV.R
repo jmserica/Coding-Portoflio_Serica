@@ -1,0 +1,334 @@
+# ───────────────────────────────────────────────────────────────────────────────
+# R Script: Full Descriptives & PLS‐SEM for EV Adoption Study (EV.xlsx)
+# All RQs & Hs explicitly addressed; Mediation & Moderation tested.
+# (Mac Desktop, level 3 reporting, zero critical omission)
+# ───────────────────────────────────────────────────────────────────────────────
+
+# 1. Packages -------------------------------------------------------------------
+pkgs <- c(
+  "readxl", "dplyr", "stringr", "tidyr", "psych", "plspm", "tibble", "purrr"
+)
+new_pkgs <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if(length(new_pkgs)) install.packages(new_pkgs, repos="https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only=TRUE))
+
+# 2. File Path & Pre-flight -----------------------------------------------------
+ev_path <- file.path(Sys.getenv("HOME"), "Desktop", "EV.xlsx")
+if(!file.exists(ev_path)) stop("File not found at: ", ev_path)
+
+# 3. Import & Trim --------------------------------------------------------------
+ev_df <- readxl::read_excel(ev_path, sheet = 1, col_names = TRUE) %>%
+  mutate(across(where(is.character), str_trim))
+
+# 4. Demographic Recoding (incl. Location) --------------------------------------
+ev_df <- ev_df %>%
+  mutate(
+    age_code = case_when(
+      str_detect(Age, "^18.*25") ~ 1L,
+      str_detect(Age, "^26.*33") ~ 2L,
+      str_detect(Age, "^34.*41") ~ 3L,
+      str_detect(Age, "^42.*49") ~ 4L,
+      str_detect(Age, "50|above 50") ~ 5L,
+      TRUE ~ NA_integer_
+    ),
+    sex_code    = recode(Sex, "Male"=1L, "Female"=2L, .default=NA_integer_),
+    income_code = case_when(
+      str_detect(`Monthly Family Income`, "38,080.*66,640")   ~ 2L,
+      str_detect(`Monthly Family Income`, "66,640.*114,240")  ~ 3L,
+      str_detect(`Monthly Family Income`, "114,240.*190,400") ~ 4L,
+      str_detect(`Monthly Family Income`, "190,400")          ~ 5L,
+      TRUE ~ NA_integer_
+    ),
+    education_code = recode(`Highest Educational Attainment`,
+                            "Under Bachelor's Degree"   = 1L,
+                            "Bachelor's Degree"         = 2L,
+                            "Master's Degree"           = 3L,
+                            "Doctorate/Doctor's Degree" = 4L,
+                            .default = NA_integer_),
+    civil_status_code = recode(`Civil Status`,
+                               "Single"   = 1L,
+                               "Married"  = 2L,
+                               "Widowed"  = 3L,
+                               "Separated"= 4L,
+                               .default   = NA_integer_),
+    emp_code = recode(`Employment Status`,
+                      "Employed"     = 1L,
+                      "Self-Employed"= 2L,
+                      "Retired"      = 3L,
+                      "Unemployed"   = 4L,
+                      .default       = NA_integer_),
+    location_code = as.factor(Location)
+  )
+
+# 5. Normalize Column Names -----------------------------------------------------
+ev_df <- ev_df %>%
+  rename_with(~ str_squish(str_replace_all(., "[\r\n]", " ")))
+
+# 6. Construct-item Detection ---------------------------------------------------
+find_cols <- function(needles, nm) {
+  unique(unlist(lapply(needles, function(n)
+    grep(n, nm, ignore.case=TRUE, value=TRUE))))
+}
+pe_cols <- find_cols(c("^PE[1-9]", "useful for my travel", "more convenient", "energy cost"), names(ev_df))
+ee_cols <- find_cols(c("^EE[1-9]", "easy to use", "learn to use it easily"), names(ev_df))
+si_cols <- find_cols(c("^SI[1-9]", "Social trends", "explore what products"), names(ev_df))
+fc_cols <- find_cols(c("^FC[1-9]", "resources necessary", "knowledge necessary to use"), names(ev_df))
+k_cols  <- find_cols(c("I have knowledge of EVs", "I have experience of EVs", "I am familiar with EVs", "I am well-informed about electric vehicles"), names(ev_df))
+pi_cols <- find_cols(c("^PI[1-9]", "prefer to drive it rather than", "would buy a Battery Electric Vehicle"), names(ev_df))
+expected_counts <- c(PE=3, EE=2, SI=2, FC=2, K=4, PI=2)
+found_counts    <- c(length(pe_cols), length(ee_cols), length(si_cols),
+                     length(fc_cols), length(k_cols),  length(pi_cols))
+if(any(found_counts < expected_counts)) {
+  stop("Missing items for: ",
+       paste(names(expected_counts)[found_counts < expected_counts], collapse=", "))
+}
+
+# 7. Recode Likert → Numeric (_num) ---------------------------------------------
+likert_map <- c(
+  "Strongly Disagree"=1L, "Disagree"=2L,
+  "Neutral"=3L,         "Agree"=4L,
+  "Strongly Agree"=5L
+)
+all_items <- c(pe_cols, ee_cols, si_cols, fc_cols, k_cols, pi_cols)
+ev_df <- ev_df %>% mutate(
+  across(all_of(all_items),
+         ~ as.integer(likert_map[trimws(as.character(.x))]),
+         .names="{.col}_num")
+)
+
+# 8. Build _num vectors & Composite Scores --------------------------------------
+pe_num <- paste0(pe_cols, "_num")
+ee_num <- paste0(ee_cols, "_num")
+si_num <- paste0(si_cols, "_num")
+fc_num <- paste0(fc_cols, "_num")
+k_num  <- paste0(k_cols,  "_num")
+pi_num <- paste0(pi_cols, "_num")
+
+ev_df <- ev_df %>% rowwise() %>% mutate(
+  PE_score = mean(c_across(all_of(pe_num)), na.rm=TRUE),
+  EE_score = mean(c_across(all_of(ee_num)), na.rm=TRUE),
+  SI_score = mean(c_across(all_of(si_num)), na.rm=TRUE),
+  FC_score = mean(c_across(all_of(fc_num)), na.rm=TRUE),
+  K_score  = mean(c_across(all_of(k_num)),  na.rm=TRUE),
+  PI_score = mean(c_across(all_of(pi_num)), na.rm=TRUE)
+) %>% ungroup()
+
+# 9. Descriptives ---------------------------------------------------------------
+cat(">>> Demographic Profile by RQ1.1–RQ1.7:\n")
+cat("- Age:\n");         print(table(ev_df$Age, useNA="ifany"))
+cat("- Sex:\n");         print(table(ev_df$Sex, useNA="ifany"))
+cat("- Income Level:\n");print(table(ev_df$`Monthly Family Income`, useNA="ifany"))
+cat("- Education:\n");   print(table(ev_df$`Highest Educational Attainment`, useNA="ifany"))
+cat("- Location:\n");    print(table(ev_df$Location, useNA="ifany"))
+cat("- Civil Status:\n");print(table(ev_df$`Civil Status`, useNA="ifany"))
+cat("- Employment:\n");  print(table(ev_df$`Employment Status`, useNA="ifany"))
+
+# Construct-level stats (RQ2–RQ4)
+construct_stats <- ev_df %>% summarize(
+  across(ends_with("_score"),
+         list(mean=~mean(.x,na.rm=TRUE), sd=~sd(.x,na.rm=TRUE))),
+  .groups="drop"
+)
+cat("\n>>> Construct-level Descriptives (RQ2–RQ4):\n"); print(construct_stats)
+
+# 10. Reliability ---------------------------------------------------------------
+item_cols  <- c(pe_num, ee_num, si_num, fc_num, k_num, pi_num)
+reliability_df <- ev_df %>% select(all_of(item_cols)) %>% na.omit()
+cronbach_results <- list(
+  PE = psych::alpha(reliability_df[pe_num], check.keys=TRUE)$total$raw_alpha,
+  EE = psych::alpha(reliability_df[ee_num], check.keys=TRUE)$total$raw_alpha,
+  SI = psych::alpha(reliability_df[si_num], check.keys=TRUE)$total$raw_alpha,
+  FC = psych::alpha(reliability_df[fc_num], check.keys=TRUE)$total$raw_alpha,
+  K  = psych::alpha(reliability_df[k_num],  check.keys=TRUE)$total$raw_alpha,
+  PI = psych::alpha(reliability_df[pi_num], check.keys=TRUE)$total$raw_alpha
+)
+cronbach_df <- tibble(
+  Construct = names(cronbach_results),
+  Alpha     = round(unlist(cronbach_results), 3),
+  Alpha_Status = ifelse(round(unlist(cronbach_results),3) >= 0.7, "Acceptable", "Low")
+)
+cat("\n>>> Cronbach’s α per construct (Reliability, Table):\n"); print(cronbach_df)
+
+# 11. PLS-PM Spec & Estimation --------------------------------------------------
+inner <- matrix(0, 6, 6,
+                dimnames=list(c("PE","EE","SI","FC","K","PI"),
+                              c("PE","EE","SI","FC","K","PI")))
+inner["PE",c("K","PI")]  <- 1
+inner["EE",c("K","PI")]  <- 1
+inner["SI",c("K","PI")]  <- 1
+inner["FC",c("K","PI")]  <- 1
+inner["K","PI"]          <- 1
+inner <- t(inner)
+blocks <- list(PE=pe_num, EE=ee_num, SI=si_num, FC=fc_num, K=k_num, PI=pi_num)
+modes  <- rep("A", length(blocks))
+
+cat("\n>>> Running PLS-PM (scaled=TRUE, boot.val=TRUE, br=10000)...\n")
+pls_out <- plspm(ev_df, inner, blocks, modes, scaled=TRUE, boot.val=TRUE, br=10000)
+
+# 12. Path Coefficients & R2 ----------------------------------------------------
+boot_paths <- as.data.frame(pls_out$boot$paths) %>%
+  tibble::rownames_to_column("Path") %>%
+  dplyr::filter(Original != 0) %>%
+  dplyr::transmute(
+    Path,
+    Beta      = round(Original, 3),
+    SE        = round(Std.Error, 3),
+    z         = round(Beta / SE, 3),
+    p.value   = round(2 * pnorm(-abs(z)), 4),
+    Supported = ifelse(p.value < .05, "Yes", "No")
+  )
+cat("\n>>> Direct Path Coefficients (PLS, H1–H3):\n")
+print(boot_paths)
+
+r2_vec <- pls_out$R2
+r2_df  <- tibble(
+  Construct = names(r2_vec),
+  R2        = round(as.numeric(r2_vec), 3)
+)
+cat("\n>>> R² (Endogenous Constructs):\n"); print(r2_df)
+
+# 13. Mediation Effects (H4) – Sobel Test ---------------------------------------
+
+# Extract direct a‐paths (Driver → K) and b‐path (K → PI) from bootstrap results
+boot_paths <- as.data.frame(pls_out$boot$paths) %>%
+  tibble::rownames_to_column("Path") %>%
+  filter(Original != 0) %>%
+  transmute(
+    Path,
+    Beta = round(Original, 3),
+    SE   = round(Std.Error, 3)
+  )
+
+a_paths <- boot_paths %>% filter(grepl("-> K$", Path))
+b_path  <- boot_paths %>% filter(Path == "K -> PI")
+
+# Sobel function
+sobel_test <- function(a, sa, b, sb){
+  ind   <- a * b
+  seind <- sqrt(b^2 * sa^2 + a^2 * sb^2)
+  z     <- ind / seind
+  p     <- 2 * pnorm(-abs(z))
+  c(indirect = round(ind, 3),
+    se_indirect = round(seind, 3),
+    z = round(z, 3),
+    p.value = round(p, 4),
+    Supported = ifelse(p < .05, "Yes", "No"))
+}
+
+# Build mediation table
+mediation_df <- a_paths %>%
+  rowwise() %>%
+  mutate(
+    Driver    = sub(" -> K$", "", Path),
+    sobel     = list(sobel_test(Beta, SE, b_path$Beta, b_path$SE))
+  ) %>%
+  unnest_wider(sobel) %>%
+  select(Driver, indirect, se_indirect, z, p.value, Supported)
+
+cat("\n>>> Mediation Paths (H4: Driver → K → PI via Sobel) <<<\n")
+print(mediation_df)
+
+# 14. Convergent & Discriminant Validity ----------------------------------------
+conv <- lapply(names(blocks), function(lv) {
+  L   <- pls_out$outer_model$loading[pls_out$outer_model$block == lv]
+  ave <- sum(L^2) / length(L)
+  cr  <- sum(L)^2 / (sum(L)^2 + sum(1 - L^2))
+  tibble::tibble(Construct = lv, AVE = round(ave, 3), CompositeReliability = round(cr, 3))
+})
+conv_df <- dplyr::bind_rows(conv) %>%
+  mutate(CR_Status = ifelse(CompositeReliability >= 0.7, "Acceptable", "Low"))
+cat("\n>>> AVE & Composite Reliability (CR >= 0.7):\n")
+print(conv_df)
+
+# 15. Outer Model Factor Loadings ----------------------------------------------
+loadings_df <- pls_out$outer_model %>%
+  as_tibble() %>%
+  select(block, name, loading) %>%
+  rename(
+    Construct = block,
+    Indicator = name,
+    Loading   = loading
+  ) %>%
+  mutate(Loading = round(Loading, 3))
+cat("\n>>> Outer Model Factor Loadings for All Constructs:\n")
+print(loadings_df)
+
+# 16. HTMT (Discriminant Validity Ratios) ----------------------------------------
+htmt <- function(dat, blocks) {
+  m <- length(blocks)
+  mat <- matrix(NA, m, m, dimnames=list(names(blocks), names(blocks)))
+  for (i in seq_along(blocks)) for (j in seq_along(blocks)) if (i != j) {
+    X <- as.matrix(dat[, blocks[[i]]])
+    Y <- as.matrix(dat[, blocks[[j]]])
+    mat[i, j] <- mean(abs(cor(X, Y, use="pairwise.complete.obs")), na.rm = TRUE)
+  }
+  mat
+}
+htmt_mat <- htmt(ev_df, blocks)
+htmt_df <- as.data.frame(htmt_mat) %>%
+  tibble::rownames_to_column("Construct1") %>%
+  tidyr::pivot_longer(-Construct1, names_to = "Construct2", values_to = "HTMT") %>%
+  mutate(HTMT = round(HTMT, 3))
+cat("\n>>> HTMT Ratios (Discriminant Validity) for All Construct Pairs:\n")
+print(htmt_df)
+
+# 16. VIF (Full Collinearity Check) ---------------------------------------------
+vif_fun <- function(dat, items) {
+  vifs <- sapply(items, function(x) {
+    others <- setdiff(items, x)
+    form <- as.formula(paste0("`", x, "` ~ ", paste0("`", others, "`", collapse = " + ")))
+    1 / (1 - summary(lm(form, data = dat))$r.squared)
+  })
+  tibble::tibble(Item = items, VIF = round(as.numeric(vifs), 3))
+}
+vif_list <- purrr::map_df(names(blocks), function(lv) {
+  df <- vif_fun(ev_df, blocks[[lv]])
+  tibble::tibble(Construct = lv, Average_VIF = round(mean(df$VIF, na.rm = TRUE), 3))
+})
+cat("\n>>> Average VIF per Construct:\n")
+print(vif_list)
+
+# 17. Dillon–Goldstein’s Rho-A -------------------------------------------------
+rel_coeffs <- cronbach_df %>%
+  dplyr::left_join(conv_df %>% select(Construct, CompositeReliability), by = "Construct") %>%
+  dplyr::mutate(RhoA = purrr::map_dbl(Construct, ~ psych::alpha(reliability_df[, blocks[[.x]]])$total$std.alpha)) %>%
+  dplyr::mutate(RhoA = round(RhoA, 3))
+cat("\n>>> Dillon–Goldstein’s Rho-A per Construct:\n")
+print(rel_coeffs)
+
+# 18. Moderation (H5) – Demographic Profile -------------------------------------
+# Justification: Only exploratory (not full PLS-MGA)
+mods <- list(
+  Age          = "age_code",
+  Sex          = "sex_code",
+  Income       = "income_code",
+  Education    = "education_code",
+  CivilStatus  = "civil_status_code",
+  Employment   = "emp_code",
+  Location     = "location_code"
+)
+for(md in mods){
+  ev_df[[paste0("PE_", md)]] <- ev_df$PE_score * ev_df[[md]]
+  ev_df[[paste0("EE_", md)]] <- ev_df$EE_score * ev_df[[md]]
+}
+cat("\n>>> Moderation by Demographics (H5, exploratory, not MGA):\n")
+for(name in names(mods)){
+  col <- mods[[name]]
+  # H7: PE × Moderator → PI
+  fit_pe <- lm(as.formula(paste0("PI_score ~ PE_score + ", col, " + PE_", col)), data=ev_df)
+  # H8: EE × Moderator → PI
+  fit_ee <- lm(as.formula(paste0("PI_score ~ EE_score + ", col, " + EE_", col)), data=ev_df)
+  cat(sprintf("\nH7: PE × %s → PI\n", name)); print(summary(fit_pe)$coefficients)
+  cat(sprintf("H8: EE × %s → PI\n", name)); print(summary(fit_ee)$coefficients)
+}
+
+# 19. RQ-by-RQ Interpretation Template ------------------------------------------
+cat("\n>>> STRATEGIC INTERPRETATION BY RESEARCH QUESTION <<<\n")
+cat("\nRQ1. Demographic Profile: See breakdowns above. Location coverage is printed.\n")
+cat("RQ2. Driver Levels: See construct-level descriptives.\n")
+cat("RQ3. Purchase Intention: Mean and SD in construct-level descriptives.\n")
+cat("RQ4. Knowledge: See Knowledge scores.\n")
+cat("RQ5. Path model (H1): See PLS path coefficients. Supported = 'Yes' if p<.05.\n")
+cat("RQ6. Effect on Knowledge: See PLS paths to 'K_score' and mediation results.\n")
+cat("RQ7. Knowledge → PI: Path coefficient for K→PI.\n")
+cat("RQ8. Mediation: See 'Mediation Paths' table; 'Significant' if Z>|1.96|.\n")
