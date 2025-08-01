@@ -1,0 +1,25 @@
+import schedule, time
+from sqlalchemy import create_engine
+
+# DB connection (e.g. Postgres)
+engine = create_engine('postgresql://user:pass@db:5432/analytics')
+
+def check_funnel_health():
+    query = """
+    SELECT stage,
+           COUNT(*) AS count,
+           ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct
+    FROM user_events
+    WHERE event_date = CURRENT_DATE
+    GROUP BY stage;
+    """
+    df = pd.read_sql(query, engine)
+    print(f"[{pd.Timestamp.now()}] Today's funnel breakdown")
+    print(df)
+
+# Schedule to run hourly
+schedule.every().hour.at(":00").do(check_funnel_health)
+
+while True:
+    schedule.run_pending()
+    time.sleep(30)
