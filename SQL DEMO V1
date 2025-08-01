@@ -1,0 +1,145 @@
+-- =========================
+-- Funnel Stage Views
+-- =========================
+
+CREATE OR REPLACE VIEW vw_funnel_leads AS
+SELECT
+  lead_id,
+  created_at AS lead_created_at,
+  source_channel AS lead_source,
+  region,
+  campaign_id
+FROM crm.leads
+WHERE created_at >= DATEADD(month, -6, CURRENT_DATE);
+
+CREATE OR REPLACE VIEW vw_funnel_qualified AS
+SELECT
+  l.lead_id,
+  l.lead_created_at,
+  l.lead_source,
+  l.region,
+  q.qualified_at
+FROM vw_funnel_leads l
+JOIN crm.lead_qualifications q ON l.lead_id = q.lead_id
+WHERE q.status = 'Qualified';
+
+CREATE OR REPLACE VIEW vw_funnel_booked AS
+SELECT
+  q.lead_id,
+  q.lead_created_at,
+  q.lead_source,
+  q.region,
+  b.booked_at
+FROM vw_funnel_qualified q
+JOIN crm.demo_bookings b ON q.lead_id = b.lead_id
+WHERE b.status = 'Scheduled';
+
+CREATE OR REPLACE VIEW vw_funnel_closed AS
+SELECT
+  b.lead_id,
+  b.lead_created_at,
+  b.lead_source,
+  b.region,
+  o.closed_at,
+  o.deal_value
+FROM vw_funnel_booked b
+JOIN sales.opportunities o ON b.lead_id = o.lead_id
+WHERE o.stage = 'Closed Won';
+
+CREATE OR REPLACE VIEW vw_funnel_onboarded AS
+SELECT
+  c.lead_id,
+  c.lead_created_at,
+  c.lead_source,
+  c.region,
+  o.onboarded_at
+FROM vw_funnel_closed c
+JOIN cs.onboarding o ON c.lead_id = o.lead_id
+WHERE o.status = 'Complete';
+
+-- =========================
+-- Funnel Metrics Aggregation
+-- =========================
+
+CREATE OR REPLACE VIEW vw_funnel_metrics AS
+WITH
+  s_leads AS (SELECT COUNT(*) AS leads FROM vw_funnel_leads),
+  s_qualified AS (SELECT COUNT(*) AS qualified FROM vw_funnel_qualified),
+  s_booked AS (SELECT COUNT(*) AS booked FROM vw_funnel_booked),
+  s_closed AS (SELECT COUNT(*) AS closed FROM vw_funnel_closed),
+  s_onboarded AS (SELECT COUNT(*) AS onboarded FROM vw_funnel_onboarded)
+SELECT
+  l.leads,
+  q.qualified,
+  b.booked,
+  c.closed,
+  o.onboarded,
+  ROUND(q.qualified::NUMERIC / l.leads * 100, 2) AS pct_qualify,
+  ROUND(b.booked::NUMERIC / q.qualified * 100, 2) AS pct_booked,
+  ROUND(c.closed::NUMERIC / b.booked * 100, 2) AS pct_closed,
+  ROUND(o.onboarded::NUMERIC / c.closed * 100, 2) AS pct_onboarded,
+  l.leads - q.qualified AS drop_lead_to_qualify,
+  q.qualified - b.booked AS drop_qualify_to_book,
+  b.booked - c.closed AS drop_book_to_close,
+  c.closed - o.onboarded AS drop_close_to_onboard
+FROM s_leads l, s_qualified q, s_booked b, s_closed c, s_onboarded o;
+
+-- =========================
+-- CAC Metrics
+-- =========================
+
+CREATE OR REPLACE VIEW vw_cac_metrics AS
+WITH
+  spend AS (
+    SELECT
+      campaign_id,
+      SUM(spend_amount) AS total_spend
+    FROM marketing.ad_spend
+    WHERE date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '6 month'
+    GROUP BY campaign_id
+  ),
+  acquired AS (
+    SELECT
+      lead_source AS channel,
+      COUNT(DISTINCT lead_id) AS new_customers
+    FROM vw_funnel_closed
+    GROUP BY lead_source
+  )
+SELECT
+  s.campaign_id,
+  s.total_spend,
+  a.new_customers,
+  ROUND(s.total_spend::NUMERIC / NULLIF(a.new_customers,0), 2) AS cac_per_customer
+FROM spend s
+LEFT JOIN acquired a ON s.campaign_id = a.channel;
+
+-- =========================
+-- Funnel Conversion Times
+-- =========================
+
+CREATE OR REPLACE VIEW vw_conversion_times AS
+SELECT
+  q.lead_id,
+  EXTRACT(epoch FROM (b.booked_at - q.qualified_at)) / 3600 AS hrs_to_book,
+  EXTRACT(epoch FROM (c.closed_at - b.booked_at)) / 3600 AS hrs_to_close,
+  EXTRACT(epoch FROM (o.onboarded_at - c.closed_at)) / 3600 AS hrs_to_onboard
+FROM vw_funnel_qualified q
+LEFT JOIN vw_funnel_booked b USING (lead_id)
+LEFT JOIN vw_funnel_closed c USING (lead_id)
+LEFT JOIN vw_funnel_onboarded o USING (lead_id);
+
+-- =========================
+-- Closed Deals Forecast
+-- =========================
+
+CREATE OR REPLACE VIEW vw_closed_forecast AS
+SELECT
+  date_trunc('month', closed_at) AS month,
+  COUNT(*) AS actual_closed,
+  AVG(COUNT(*)) OVER (
+    ORDER BY date_trunc('month', closed_at)
+    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+  ) AS forecast_closed
+FROM vw_funnel_closed
+GROUP BY 1
+ORDER BY 1;
