@@ -1,0 +1,20 @@
+import pandas as pd
+
+# Load channel spend & acquisition data
+spend = pd.read_csv('channel_spend.csv', parse_dates=['date'])
+leads = pd.read_csv('leads.csv', parse_dates=['created_at'])
+
+# Aggregate on a monthly basis
+monthly_spend = spend.set_index('date').groupby('channel')['amount'].resample('M').sum()
+monthly_acq   = leads.set_index('created_at').groupby('channel')['user_id'].resample('M').nunique()
+
+# Merge and compute CAC
+cac = (monthly_spend
+       .rename('spend')
+       .to_frame()
+       .join(monthly_acq.rename('new_users'))
+       .assign(cac=lambda df: df['spend'] / df['new_users'])
+       .reset_index()
+)
+
+print(cac.sort_values(['channel','date']).head())
