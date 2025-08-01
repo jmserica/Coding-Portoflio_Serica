@@ -1,0 +1,162 @@
+-- =========================
+-- Unified Lead Table
+-- =========================
+
+CREATE OR REPLACE VIEW vw_all_leads AS
+SELECT
+  'hubspot' AS source_system,
+  id AS lead_id,
+  createdate AS lead_created_at,
+  region,
+  campaign_id,
+  lead_status
+FROM stg_hubspot_leads
+
+UNION ALL
+
+SELECT
+  'salesforce' AS source_system,
+  sf_lead_id AS lead_id,
+  created_date AS lead_created_at,
+  region,
+  campaign_id,
+  lead_status
+FROM stg_salesforce_leads
+
+UNION ALL
+
+SELECT
+  'pipedrive' AS source_system,
+  pd_lead_id AS lead_id,
+  add_time AS lead_created_at,
+  region,
+  campaign_id,
+  status AS lead_status
+FROM stg_pipedrive_leads;
+
+
+-- =========================
+-- Unified Opportunity Table
+-- =========================
+
+CREATE OR REPLACE VIEW vw_all_opportunities AS
+SELECT
+  'hubspot' AS source_system,
+  id AS opportunity_id,
+  lead_id,
+  dealstage AS stage,
+  amount,
+  closedate AS closed_at
+FROM stg_hubspot_opportunities
+
+UNION ALL
+
+SELECT
+  'salesforce' AS source_system,
+  sf_opportunity_id AS opportunity_id,
+  lead_id,
+  stage_name AS stage,
+  amount,
+  close_date AS closed_at
+FROM stg_salesforce_opportunities
+
+UNION ALL
+
+SELECT
+  'pipedrive' AS source_system,
+  pd_deal_id AS opportunity_id,
+  lead_id,
+  stage_name AS stage,
+  value AS amount,
+  won_time AS closed_at
+FROM stg_pipedrive_deals;
+
+
+-- =========================
+-- Funnel Stage Views
+-- =========================
+
+CREATE OR REPLACE VIEW vw_funnel_leads AS
+SELECT * FROM vw_all_leads
+WHERE lead_created_at >= DATEADD(month, -6, CURRENT_DATE);
+
+CREATE OR REPLACE VIEW vw_funnel_qualified AS
+SELECT * FROM vw_funnel_leads
+WHERE lead_status = 'Qualified';
+
+CREATE OR REPLACE VIEW vw_funnel_closed AS
+SELECT
+  o.lead_id,
+  l.lead_created_at,
+  o.closed_at,
+  o.amount AS deal_value
+FROM vw_all_opportunities o
+JOIN vw_funnel_leads l ON o.lead_id = l.lead_id
+WHERE o.stage IN ('Closed Won', 'Won');
+
+
+-- =========================
+-- Funnel Metrics Aggregation
+-- =========================
+
+CREATE OR REPLACE VIEW vw_funnel_metrics AS
+WITH
+  s_leads AS (SELECT COUNT(*) AS leads FROM vw_funnel_leads),
+  s_qualified AS (SELECT COUNT(*) AS qualified FROM vw_funnel_qualified),
+  s_closed AS (SELECT COUNT(*) AS closed FROM vw_funnel_closed)
+SELECT
+  l.leads,
+  q.qualified,
+  c.closed,
+  ROUND(q.qualified::NUMERIC / l.leads * 100, 2) AS pct_qualify,
+  ROUND(c.closed::NUMERIC / q.qualified * 100, 2) AS pct_closed,
+  l.leads - q.qualified AS drop_lead_to_qualify,
+  q.qualified - c.closed AS drop_qualify_to_close
+FROM s_leads l, s_qualified q, s_closed c;
+
+
+-- =========================
+-- CAC Metrics (Example)
+-- =========================
+
+CREATE OR REPLACE VIEW vw_cac_metrics AS
+WITH
+  spend AS (
+    SELECT
+      campaign_id,
+      SUM(spend_amount) AS total_spend
+    FROM marketing.ad_spend
+    WHERE date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '6 month'
+    GROUP BY campaign_id
+  ),
+  acquired AS (
+    SELECT
+      campaign_id,
+      COUNT(DISTINCT lead_id) AS new_customers
+    FROM vw_funnel_closed
+    GROUP BY campaign_id
+  )
+SELECT
+  s.campaign_id,
+  s.total_spend,
+  a.new_customers,
+  ROUND(s.total_spend::NUMERIC / NULLIF(a.new_customers,0), 2) AS cac_per_customer
+FROM spend s
+LEFT JOIN acquired a ON s.campaign_id = a.campaign_id;
+
+
+-- =========================
+-- Closed Deals Forecast (Rolling 3-Month)
+-- =========================
+
+CREATE OR REPLACE VIEW vw_closed_forecast AS
+SELECT
+  date_trunc('month', closed_at) AS month,
+  COUNT(*) AS actual_closed,
+  AVG(COUNT(*)) OVER (
+    ORDER BY date_trunc('month', closed_at)
+    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+  ) AS forecast_closed
+FROM vw_funnel_closed
+GROUP BY 1
+ORDER BY 1;
