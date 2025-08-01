@@ -1,0 +1,39 @@
+import pandas as pd
+
+# 1. Ingest raw event data
+events = pd.read_csv('events.csv', parse_dates=['timestamp'])
+
+# 2. Define funnel stages
+stage_map = {
+    'lead_created': 'lead',
+    'qualified':    'qualify',
+    'demo_booked':  'book',
+    'deal_closed':  'close',
+    'onboarded':    'onboard'
+}
+
+events['stage'] = events['event_type'].map(stage_map)
+
+# 3. Pivot to get first timestamp per user per stage
+first_touch = (events
+    .sort_values('timestamp')
+    .drop_duplicates(subset=['user_id','stage'])
+    .pivot(index='user_id', columns='stage', values='timestamp')
+)
+
+# 4. Calculate time deltas between stages
+for prev, nxt in [('lead','qualify'), ('qualify','book'), ('book','close'), ('close','onboard')]:
+    first_touch[f'{prev}_to_{nxt}_days'] = (
+        first_touch[nxt] - first_touch[prev]
+    ).dt.days
+
+# 5. Output summary metrics
+funnel_summary = first_touch.agg({
+    'lead': 'count',
+    'qualify': 'count',
+    'book': 'count',
+    'close': 'count',
+    'onboard': 'count'
+}).rename('users')
+funnel_summary['conversion_rate'] = funnel_summary / funnel_summary.loc['lead']
+print(funnel_summary)
