@@ -1,0 +1,107 @@
+WITH filtered_sales AS (
+    -- Exclude outliers: only keep transactions within 1st and 99th percentile per region/product/segment
+    SELECT
+        s.*,
+        mc.segment
+    FROM
+        sales s
+    JOIN marketing_campaigns mc
+        ON s.region = mc.region
+        AND s.product_id = mc.product_id
+    WHERE
+        s.amount BETWEEN
+            PERCENTILE_CONT(0.01) WITHIN GROUP (ORDER BY s.amount) OVER (PARTITION BY s.region, s.product_id)
+            AND
+            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY s.amount) OVER (PARTITION BY s.region, s.product_id)
+),
+cohorts AS (
+    -- Assign cohort: pre-campaign, during, or post-campaign based on sale_date vs. campaign window
+    SELECT
+        fs.*,
+        mc.campaign_id,
+        mc.start_date,
+        mc.end_date,
+        CASE
+            WHEN fs.sale_date < mc.start_date THEN 'pre_campaign'
+            WHEN fs.sale_date BETWEEN mc.start_date AND mc.end_date THEN 'during_campaign'
+            WHEN fs.sale_date > mc.end_date THEN 'post_campaign'
+        END AS cohort_period
+    FROM
+        filtered_sales fs
+    JOIN marketing_campaigns mc
+        ON fs.region = mc.region
+        AND fs.product_id = mc.product_id
+        AND fs.segment = mc.segment
+        AND fs.sale_date BETWEEN mc.start_date - INTERVAL '30 day' AND mc.end_date + INTERVAL '60 day'
+),
+conversion_base AS (
+    -- Calculate key conversion and revenue KPIs per cohort/region/product/segment
+    SELECT
+        campaign_id,
+        region,
+        product_id,
+        segment,
+        cohort_period,
+        COUNT(DISTINCT customer_id) AS users,
+        SUM(CASE WHEN is_repeat_customer THEN 1 ELSE 0 END) AS repeat_users,
+        COUNT(*) AS total_transactions,
+        SUM(amount) AS total_revenue,
+        AVG(amount) AS avg_revenue_per_transaction
+    FROM
+        cohorts
+    GROUP BY
+        campaign_id, region, product_id, segment, cohort_period
+),
+roi_calc AS (
+    -- Calculate campaign ROI: uplift in revenue per user, conversion, etc.
+    SELECT
+        cb.region,
+        cb.product_id,
+        cb.segment,
+        cb.campaign_id,
+        MAX(CASE WHEN cb.cohort_period = 'pre_campaign' THEN cb.total_revenue / NULLIF(cb.users,0) END) AS pre_revenue_per_user,
+        MAX(CASE WHEN cb.cohort_period = 'during_campaign' THEN cb.total_revenue / NULLIF(cb.users,0) END) AS during_revenue_per_user,
+        MAX(CASE WHEN cb.cohort_period = 'post_campaign' THEN cb.total_revenue / NULLIF(cb.users,0) END) AS post_revenue_per_user,
+        MAX(CASE WHEN cb.cohort_period = 'pre_campaign' THEN cb.total_transactions / NULLIF(cb.users,0) END) AS pre_conversion_rate,
+        MAX(CASE WHEN cb.cohort_period = 'during_campaign' THEN cb.total_transactions / NULLIF(cb.users,0) END) AS during_conversion_rate,
+        MAX(CASE WHEN cb.cohort_period = 'post_campaign' THEN cb.total_transactions / NULLIF(cb.users,0) END) AS post_conversion_rate
+    FROM
+        conversion_base cb
+    GROUP BY
+        cb.region, cb.product_id, cb.segment, cb.campaign_id
+),
+final_campaign_ranking AS (
+    -- Join ROI with campaign metadata, compute ROI uplift, rank
+    SELECT
+        r.*,
+        mc.budget,
+        mc.objective,
+        mc.expected_roi,
+        (post_revenue_per_user - pre_revenue_per_user) / NULLIF(mc.budget,0) AS roi_uplift_per_dollar,
+        RANK() OVER (PARTITION BY r.region, r.product_id, r.segment ORDER BY (post_revenue_per_user - pre_revenue_per_user) DESC) AS campaign_rank
+    FROM
+        roi_calc r
+    JOIN marketing_campaigns mc
+        ON r.campaign_id = mc.campaign_id
+)
+SELECT
+    region,
+    product_id,
+    segment,
+    campaign_id,
+    objective,
+    budget,
+    expected_roi,
+    pre_revenue_per_user,
+    during_revenue_per_user,
+    post_revenue_per_user,
+    pre_conversion_rate,
+    during_conversion_rate,
+    post_conversion_rate,
+    roi_uplift_per_dollar,
+    campaign_rank
+FROM
+    final_campaign_ranking
+ORDER BY
+    region, product_id, segment, campaign_rank
+LIMIT 100;
