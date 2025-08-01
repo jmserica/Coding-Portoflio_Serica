@@ -1,0 +1,30 @@
+WITH funnel_events AS (
+  SELECT
+    campaign_id,
+    customer_id,
+    MIN(CASE WHEN event_type = 'lead_submitted' THEN event_time END) AS lead_ts,
+    MIN(CASE WHEN event_type = 'demo_requested' THEN event_time END) AS demo_ts,
+    MIN(CASE WHEN event_type = 'trial_converted' THEN event_time END) AS paid_ts
+  FROM customer_events
+  WHERE event_time >= DATE_TRUNC('quarter', CURRENT_DATE) - INTERVAL '3 months'
+  GROUP BY campaign_id, customer_id
+),
+aggregated AS (
+  SELECT
+    campaign_id,
+    COUNT(customer_id)                          AS total_leads,
+    COUNT(demo_ts)                              AS demos_requested,
+    COUNT(paid_ts)                              AS paid_conversions
+  FROM funnel_events
+  GROUP BY campaign_id
+)
+SELECT
+  campaign_id,
+  total_leads,
+  demos_requested,
+  paid_conversions,
+  ROUND(100.0 * demos_requested / NULLIF(total_leads, 0), 2) AS demo_rate_pct,
+  ROUND(100.0 * paid_conversions / NULLIF(demos_requested, 0), 2) AS trial_to_paid_pct,
+  ROUND(100.0 * paid_conversions / NULLIF(total_leads, 0), 2) AS overall_conversion_pct
+FROM aggregated
+ORDER BY overall_conversion_pct DESC;
