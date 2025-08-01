@@ -1,0 +1,27 @@
+import pandas as pd
+from tableau_api_lib import TableauServerConnection
+from tableau_api_lib.utils.querying import get_projects_dataframe
+
+# 1. Prepare dataset
+df = pd.read_csv('funnel_metrics.csv')
+
+# 2. Connect to Tableau Server
+conn = TableauServerConnection(
+    server='https://tableau.mycompany.com',
+    api_key_name='MY_API_KEY_NAME',
+    api_key_value='MY_SECRET_KEY',
+    site_id='GrowthAnalytics'
+)
+conn.sign_in()
+
+# 3. Publish data source
+project_id = get_projects_dataframe(conn).query("name=='Analytics'")['id'].iloc[0]
+conn.publish_data_source(
+    datasource_file_path='funnel_metrics.hyper',
+    datasource_name='Daily Funnel Metrics',
+    project_id=project_id,
+    connection_credentials=None,
+    overwrite=True
+)
+
+conn.sign_out()
