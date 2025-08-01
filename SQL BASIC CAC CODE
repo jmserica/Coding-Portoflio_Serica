@@ -1,0 +1,29 @@
+WITH monthly_spend AS (
+  SELECT
+    channel,
+    DATE_TRUNC('month', spend_date) AS month,
+    SUM(amount_spent) AS total_spend
+  FROM marketing_spend
+  WHERE spend_date < DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY channel, 1
+),
+new_customers AS (
+  SELECT
+    acquisition_channel AS channel,
+    DATE_TRUNC('month', signup_date) AS month,
+    COUNT(DISTINCT customer_id) AS customers_acquired
+  FROM users
+  WHERE signup_date < DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY channel, 1
+)
+SELECT
+  ms.channel,
+  ms.month,
+  ms.total_spend,
+  nc.customers_acquired,
+  ROUND(ms.total_spend::numeric / NULLIF(nc.customers_acquired, 0), 2) AS cac
+FROM monthly_spend ms
+LEFT JOIN new_customers nc
+  ON ms.channel = nc.channel
+ AND ms.month   = nc.month
+ORDER BY ms.month DESC, cac;
