@@ -1,0 +1,499 @@
+-- ============================================================
+-- JEWELRY ANALYTICS: Unified SKU + Variety + 4Cs SQL Framework
+-- Dialect: PostgreSQL 13+
+-- ============================================================
+
+-- ======================
+-- [A] CONFIG / SOURCES
+-- ======================
+-- Replace these with your actual tables or views.
+-- Grain assumptions:
+--   POS: one row per transaction line (sku_id, qty, gross_amt, discount_amt, tx_ts, store_id, customer_id)
+--   INV: one row per day per sku_id per store (on_hand_qty, cost, retail)
+--   SKU: one row per SKU (style-level is optional); stones listed in STONES table (one row per stone per SKU)
+--   PROMO: date-ranged promotions/markdowns
+--   STORES: one row per store
+--   CUSTOMERS: optional (for clienteling/LTV)
+CREATE SCHEMA IF NOT EXISTS jwl;
+
+CREATE OR REPLACE VIEW jwl.src_pos AS
+SELECT * FROM retail_pos;           -- CHANGE
+
+CREATE OR REPLACE VIEW jwl.src_inventory AS
+SELECT * FROM retail_inventory;     -- CHANGE
+
+CREATE OR REPLACE VIEW jwl.src_sku AS
+SELECT * FROM dim_sku;              -- CHANGE
+
+CREATE OR REPLACE VIEW jwl.src_stones AS
+SELECT * FROM dim_sku_stones;       -- CHANGE (one row per stone per SKU)
+
+CREATE OR REPLACE VIEW jwl.src_promos AS
+SELECT * FROM fact_promotions;      -- CHANGE
+
+CREATE OR REPLACE VIEW jwl.src_stores AS
+SELECT * FROM dim_store;            -- CHANGE
+
+CREATE OR REPLACE VIEW jwl.src_customers AS
+SELECT * FROM dim_customer;         -- CHANGE (optional)
+
+-- Optional: business date window
+CREATE OR REPLACE VIEW jwl.params AS
+SELECT 
+  date_trunc('day', COALESCE(MIN(tx_ts), now() - interval '365 days'))::date AS start_date,
+  date_trunc('day', COALESCE(MAX(tx_ts), now()))::date               AS end_date
+FROM jwl.src_pos;
+
+-- ======================
+-- [B] SUPPORT (Calendar)
+-- ======================
+CREATE MATERIALIZED VIEW jwl.cal AS
+WITH bounds AS (
+  SELECT (SELECT start_date FROM jwl.params) AS d0,
+         (SELECT end_date   FROM jwl.params) AS d1
+)
+SELECT dd::date AS d,
+       EXTRACT(isoyear FROM dd)::int AS iso_year,
+       EXTRACT(week    FROM dd)::int AS iso_week,
+       date_trunc('month', dd)::date AS m0
+FROM bounds, LATERAL generate_series(d0, d1, interval '1 day') dd
+WITH DATA;
+
+CREATE INDEX ON jwl.cal(d);
+CREATE INDEX ON jwl.cal(m0);
+
+-- ====================================================
+-- [C] GEM TAXONOMY: species → variety (colored stones)
+-- and Four-Cs normalization (diamonds)
+-- ====================================================
+
+-- [C1] Dictionary: diamond grade → numeric for analytics
+CREATE OR REPLACE FUNCTION jwl.grade_clarity_to_score(p text) RETURNS int AS $$
+  SELECT CASE upper(trim(p))
+    WHEN 'FL' THEN 10 WHEN 'IF' THEN 9
+    WHEN 'VVS1' THEN 8 WHEN 'VVS2' THEN 7
+    WHEN 'VS1' THEN 6  WHEN 'VS2' THEN 5
+    WHEN 'SI1' THEN 4  WHEN 'SI2' THEN 3
+    WHEN 'I1' THEN 2   WHEN 'I2' THEN 1 WHEN 'I3' THEN 0
+    ELSE NULL END;
+$$ LANGUAGE sql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION jwl.grade_color_to_score(p text) RETURNS int AS $$
+  -- D (best) -> 10, Z (worst) -> 0
+  SELECT CASE upper(trim(p))
+    WHEN 'D' THEN 10 WHEN 'E' THEN 9 WHEN 'F' THEN 8
+    WHEN 'G' THEN 7  WHEN 'H' THEN 6 WHEN 'I' THEN 5
+    WHEN 'J' THEN 4  WHEN 'K' THEN 3 WHEN 'L' THEN 2
+    WHEN 'M' THEN 1  ELSE 0 END;
+$$ LANGUAGE sql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION jwl.grade_cut_to_score(p text) RETURNS int AS $$
+  SELECT CASE upper(trim(p))
+    WHEN 'EX' THEN 10 WHEN 'VG' THEN 8 WHEN 'G' THEN 6
+    WHEN 'F' THEN 3  WHEN 'P' THEN 1 ELSE NULL END;
+$$ LANGUAGE sql IMMUTABLE;
+
+-- [C2] Variety resolver (species + color + transparency + phenomenon)
+-- Implements GIA logic: variety is a subcategory of species, most often by color;
+-- transparency may govern (e.g., carnelian vs jasper); phenomenon can refine (star ruby).
+CREATE OR REPLACE FUNCTION jwl.resolve_variety(
+  p_species text, p_color text, p_transparency text, p_phenomenon text
+) RETURNS text AS $$
+DECLARE sp text := lower(coalesce(p_species,''));
+        hue text := lower(coalesce(p_color,''));
+        tr  text := lower(coalesce(p_transparency,''));
+        ph  text := lower(coalesce(p_phenomenon,''));
+BEGIN
+  -- Corundum: ruby vs sapphire (color-driven), phenomenal variants
+  IF sp = 'corundum' THEN
+    IF ph LIKE '%star%' THEN
+      IF hue LIKE '%red%' THEN RETURN 'Star Ruby';
+      ELSE RETURN 'Star Sapphire'; END IF;
+    END IF;
+    IF hue LIKE '%red%' THEN RETURN 'Ruby';
+    ELSE RETURN 'Sapphire'; END IF;
+  END IF;
+
+  -- Beryl: emerald (green), aquamarine (greenish blue)
+  IF sp = 'beryl' THEN
+    IF hue LIKE '%green%' AND hue NOT LIKE '%blue%' THEN RETURN 'Emerald';
+    ELSIF hue LIKE '%blue%' THEN RETURN 'Aquamarine';
+    ELSE RETURN 'Beryl (other variety)'; END IF;
+  END IF;
+
+  -- Quartz: amethyst (purple), citrine (yellow)
+  IF sp = 'quartz' THEN
+    IF hue LIKE '%purple%' THEN RETURN 'Amethyst';
+    ELSIF hue LIKE '%yellow%' OR hue LIKE '%orange%' THEN RETURN 'Citrine';
+    ELSE RETURN 'Quartz (other variety)'; END IF;
+  END IF;
+
+  -- Chalcedony: transparency-driven (carnelian vs jasper)
+  IF sp = 'chalcedony' THEN
+    IF hue LIKE '%brownish orange%' OR hue LIKE '%orange%' THEN
+      IF tr IN ('transparent','translucent') THEN RETURN 'Carnelian';
+      ELSE RETURN 'Jasper'; END IF;
+    END IF;
+    RETURN 'Chalcedony (other variety)';
+  END IF;
+
+  -- Diamond (not a "variety" in same sense; handled via 4Cs)
+  IF sp = 'diamond' THEN
+    IF hue LIKE '%fancy%' OR hue ~ '(pink|blue|yellow|green|brown|black)' THEN
+      RETURN 'Diamond (Fancy Color)';
+    ELSE
+      RETURN 'Diamond (Colorless Range)';
+    END IF;
+  END IF;
+
+  -- Fallback
+  IF sp <> '' THEN RETURN initcap(sp)||' (unspecified variety)'; END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- [C3] Stone master (one row per stone with normalized taxonomy + 4C scores where relevant)
+CREATE MATERIALIZED VIEW jwl.stone_master AS
+SELECT
+  s.stone_id,
+  s.sku_id,
+  lower(s.gem_species)  AS gem_species,
+  jwl.resolve_variety(s.gem_species, s.color_hue, s.transparency, s.phenomenon) AS gem_variety,
+  COALESCE(NULLIF(s.lab_grown_flag,''), 'N')::text AS lab_grown_flag, -- disclosure matters
+  -- Core attributes
+  s.role as stone_role,                      -- center/side/melee/etc.
+  s.shape,                                   -- round, oval, etc.
+  s.carat_weight,
+  s.color_grade,
+  s.clarity_grade,
+  s.cut_grade,
+  jwl.grade_color_to_score(s.color_grade)   AS color_score,
+  jwl.grade_clarity_to_score(s.clarity_grade) AS clarity_score,
+  jwl.grade_cut_to_score(s.cut_grade)       AS cut_score
+FROM jwl.src_stones s
+WITH DATA;
+
+CREATE INDEX ON jwl.stone_master(sku_id);
+CREATE INDEX ON jwl.stone_master(gem_species, gem_variety);
+
+-- [C4] SKU master normalized (metal, mounting, counts of stones, quality indexes)
+CREATE MATERIALIZED VIEW jwl.sku_master AS
+WITH agg AS (
+  SELECT
+    sku_id,
+    COUNT(*) FILTER (WHERE gem_species='diamond')                           AS n_diamonds,
+    SUM(carat_weight) FILTER (WHERE gem_species='diamond')                  AS ct_diamond,
+    MAX(color_score) FILTER (WHERE stone_role='center' AND gem_species='diamond')  AS ctr_color_score,
+    MAX(clarity_score) FILTER (WHERE stone_role='center' AND gem_species='diamond') AS ctr_clarity_score,
+    MAX(cut_score)    FILTER (WHERE stone_role='center' AND gem_species='diamond')  AS ctr_cut_score,
+    array_agg(DISTINCT gem_variety ORDER BY gem_variety)                    AS varieties
+  FROM jwl.stone_master
+  GROUP BY sku_id
+)
+SELECT
+  p.sku_id,
+  p.product_name,
+  p.product_type,                  -- ring/necklace/earrings/bracelet/watch
+  p.brand,
+  p.collection,
+  p.metal_type,                    -- gold/platinum/silver/palladium
+  p.metal_color,                   -- yellow/white/rose
+  p.metal_fineness,                -- e.g., 14K, 18K, 950Pt
+  p.metal_weight_g,
+  COALESCE(a.n_diamonds,0) AS n_diamonds,
+  COALESCE(a.ct_diamond,0) AS ct_diamond,
+  a.ctr_color_score, a.ctr_clarity_score, a.ctr_cut_score,
+  a.varieties
+FROM jwl.src_sku p
+LEFT JOIN agg a USING (sku_id)
+WITH DATA;
+
+CREATE INDEX ON jwl.sku_master(product_type);
+CREATE INDEX ON jwl.sku_master(metal_type, metal_color);
+CREATE INDEX ON jwl.sku_master(varieties);
+
+-- ==========================================
+-- [D] CARE FLAGS (durability & cleaning risk)
+-- ==========================================
+-- Example rules: Pearls: never steam clean (explicit). Extend as you add vetted rules.
+CREATE MATERIALIZED VIEW jwl.sku_care_flags AS
+SELECT
+  sm.sku_id,
+  CASE 
+    WHEN EXISTS (
+      SELECT 1 FROM jwl.stone_master x 
+      WHERE x.sku_id = sm.sku_id AND lower(x.gem_variety) LIKE '%pearl%'
+    ) THEN 'NO_STEAM'  -- pearls: do not steam-clean
+  END AS care_flag
+FROM jwl.sku_master sm
+WITH DATA;
+
+CREATE INDEX ON jwl.sku_care_flags(sku_id);
+
+-- ==========================================
+-- [E] SALES / RETURNS / PRICING NORMALIZATION
+-- ==========================================
+CREATE MATERIALIZED VIEW jwl.txn AS
+SELECT
+  p.tx_id,
+  p.tx_ts::timestamp              AS ts,
+  p.store_id,
+  p.customer_id,
+  p.sku_id,
+  p.qty::numeric                  AS qty,
+  (p.gross_amt - p.discount_amt)::numeric AS net_revenue,
+  NULLIF(p.discount_amt,0)::numeric       AS discount_amt,
+  CASE WHEN COALESCE(p.gross_amt,0)=0 THEN NULL 
+       ELSE (p.discount_amt / NULLIF(p.gross_amt,0)) END AS discount_pct
+FROM jwl.src_pos p
+WITH DATA;
+
+CREATE INDEX ON jwl.txn(ts);
+CREATE INDEX ON jwl.txn(sku_id);
+CREATE INDEX ON jwl.txn(store_id);
+
+-- Price-per-carat (for stones; center priority for diamonds)
+CREATE MATERIALIZED VIEW jwl.txn_quality_enriched AS
+WITH ctr AS (
+  SELECT sku_id,
+         MAX(carat_weight) FILTER (WHERE stone_role='center' AND gem_species='diamond') AS ctr_ct,
+         MAX(cut_score)    FILTER (WHERE stone_role='center' AND gem_species='diamond') AS ctr_cut,
+         MAX(color_score)  FILTER (WHERE stone_role='center' AND gem_species='diamond') AS ctr_color,
+         MAX(clarity_score)FILTER (WHERE stone_role='center' AND gem_species='diamond') AS ctr_clarity
+  FROM jwl.stone_master
+  GROUP BY sku_id
+),
+any_ct AS (
+  SELECT sku_id,
+         NULLIF(SUM(carat_weight),0) AS total_ct
+  FROM jwl.stone_master
+  GROUP BY sku_id
+)
+SELECT
+  t.*,
+  s.product_type, s.brand, s.collection, s.metal_type, s.metal_color, s.metal_fineness,
+  c.ctr_ct, c.ctr_cut, c.ctr_color, c.ctr_clarity,
+  a.total_ct,
+  CASE 
+    WHEN c.ctr_ct IS NOT NULL AND c.ctr_ct>0 THEN (t.net_revenue / c.ctr_ct)
+    WHEN a.total_ct IS NOT NULL AND a.total_ct>0 THEN (t.net_revenue / a.total_ct)
+    ELSE NULL
+  END AS price_per_carat
+FROM jwl.txn t
+LEFT JOIN jwl.sku_master s USING (sku_id)
+LEFT JOIN ctr c USING (sku_id)
+LEFT JOIN any_ct a USING (sku_id)
+WITH DATA;
+
+CREATE INDEX ON jwl.txn_quality_enriched(ts);
+CREATE INDEX ON jwl.txn_quality_enriched(price_per_carat);
+
+-- ==========================================
+-- [F] INVENTORY / AVAILABILITY
+-- ==========================================
+CREATE MATERIALIZED VIEW jwl.inv_daily AS
+SELECT
+  i.as_of_date::date AS d,
+  i.store_id,
+  i.sku_id,
+  i.on_hand_qty::numeric AS on_hand_qty,
+  i.cost::numeric        AS unit_cost,
+  i.retail::numeric      AS unit_retail
+FROM jwl.src_inventory i
+WITH DATA;
+
+CREATE INDEX ON jwl.inv_daily(d);
+CREATE INDEX ON jwl.inv_daily(store_id, sku_id);
+
+-- Stockouts and coverage
+CREATE MATERIALIZED VIEW jwl.inv_kpi AS
+WITH s AS (
+  SELECT d, store_id, sku_id, on_hand_qty,
+         CASE WHEN on_hand_qty<=0 THEN 1 ELSE 0 END AS oos_flag
+  FROM jwl.inv_daily
+),
+agg AS (
+  SELECT sku_id, store_id,
+         COUNT(*)                AS days,
+         SUM(oos_flag)           AS oos_days,
+         SUM(CASE WHEN on_hand_qty>0 THEN 1 ELSE 0 END) AS in_stock_days
+  FROM s
+  GROUP BY sku_id, store_id
+)
+SELECT *,
+       (1.0 - (oos_days::numeric / NULLIF(days,0))) AS on_shelf_availability
+FROM agg
+WITH DATA;
+
+CREATE INDEX ON jwl.inv_kpi(sku_id, store_id);
+
+-- ==========================================
+-- [G] PROMO EFFECTS (baseline vs lift)
+-- ==========================================
+-- Baseline = rolling median of last 8 same-weekday observations outside promo.
+CREATE MATERIALIZED VIEW jwl.daily_sales AS
+SELECT date_trunc('day', ts)::date AS d, store_id, sku_id,
+       SUM(qty) AS units, SUM(net_revenue) AS revenue
+FROM jwl.txn
+GROUP BY 1,2,3
+WITH DATA;
+
+CREATE INDEX ON jwl.daily_sales(d, store_id, sku_id);
+
+CREATE MATERIALIZED VIEW jwl.promo_calendar AS
+SELECT sku_id, store_id, promo_id, promo_type, start_date::date AS start_d, end_date::date AS end_d
+FROM jwl.src_promos
+WITH DATA;
+
+CREATE INDEX ON jwl.promo_calendar(sku_id, store_id, start_d, end_d);
+
+-- Flag promo days
+CREATE MATERIALIZED VIEW jwl.daily_sales_flags AS
+SELECT s.*,
+       EXISTS (
+         SELECT 1 FROM jwl.promo_calendar p
+         WHERE p.sku_id = s.sku_id
+           AND (p.store_id = s.store_id OR p.store_id IS NULL)
+           AND s.d BETWEEN p.start_d AND p.end_d
+       ) AS is_promo
+FROM jwl.daily_sales s
+WITH DATA;
+
+-- Rolling median baseline by weekday (non-promo)
+CREATE EXTENSION IF NOT EXISTS tablefunc;
+
+CREATE MATERIALIZED VIEW jwl.baseline AS
+WITH base AS (
+  SELECT s.*, EXTRACT(dow FROM s.d)::int AS dow
+  FROM jwl.daily_sales_flags s
+  WHERE NOT is_promo
+),
+lagged AS (
+  SELECT b.*, 
+         (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY units)
+            FROM jwl.daily_sales_flags s2
+           WHERE s2.sku_id=b.sku_id AND s2.store_id=b.store_id
+             AND EXTRACT(dow FROM s2.d)=b.dow
+             AND s2.d BETWEEN b.d - interval '90 days' AND b.d - interval '7 days'
+             AND NOT s2.is_promo) AS baseline_units
+  FROM base b
+)
+SELECT sku_id, store_id, d, COALESCE(baseline_units,0) AS baseline_units
+FROM lagged
+WITH DATA;
+
+CREATE INDEX ON jwl.baseline(sku_id, store_id, d);
+
+-- Promo lift
+CREATE MATERIALIZED VIEW jwl.promo_lift AS
+SELECT f.sku_id, f.store_id, f.d, f.units, f.revenue, f.is_promo,
+       b.baseline_units,
+       CASE WHEN f.is_promo AND b.baseline_units IS NOT NULL
+            THEN GREATEST(f.units - b.baseline_units,0)
+       END AS lift_units
+FROM jwl.daily_sales_flags f
+LEFT JOIN jwl.baseline b USING (sku_id, store_id, d)
+WITH DATA;
+
+CREATE INDEX ON jwl.promo_lift(sku_id, store_id, d);
+
+-- ==========================================
+-- [H] VARIETY / MIX KPIs
+-- ==========================================
+CREATE MATERIALIZED VIEW jwl.sku_variety_bridge AS
+SELECT DISTINCT s.sku_id, m.gem_species, m.gem_variety
+FROM jwl.sku_master s
+JOIN jwl.stone_master m USING (sku_id)
+WITH DATA;
+
+CREATE INDEX ON jwl.sku_variety_bridge(gem_species, gem_variety);
+
+-- Sales by variety
+CREATE MATERIALIZED VIEW jwl.variety_sales AS
+SELECT date_trunc('month', t.ts)::date AS month,
+       t.store_id,
+       b.gem_species, b.gem_variety,
+       SUM(t.qty) AS units,
+       SUM(t.net_revenue) AS revenue,
+       AVG(NULLIF(t.price_per_carat,0)) FILTER (WHERE b.gem_species='diamond') AS avg_price_per_carat_diamond
+FROM jwl.txn_quality_enriched t
+JOIN jwl.sku_variety_bridge b USING (sku_id)
+GROUP BY 1,2,3,4
+WITH DATA;
+
+CREATE INDEX ON jwl.variety_sales(month, store_id, gem_species, gem_variety);
+
+-- Assortment coverage per variety (stores carrying at least one on-hand)
+CREATE MATERIALIZED VIEW jwl.variety_coverage AS
+WITH onhand AS (
+  SELECT DISTINCT store_id, sku_id
+  FROM jwl.inv_daily
+  WHERE on_hand_qty > 0
+),
+cover AS (
+  SELECT v.gem_species, v.gem_variety, o.store_id, COUNT(DISTINCT o.sku_id) AS skus_on_hand
+  FROM onhand o
+  JOIN jwl.sku_variety_bridge v USING (sku_id)
+  GROUP BY 1,2,3
+)
+SELECT * FROM cover
+WITH DATA;
+
+CREATE INDEX ON jwl.variety_coverage(gem_species, gem_variety);
+
+-- ==========================================
+-- [I] METAL MIX, FEATURES → BENEFITS SIGNALS
+-- ==========================================
+CREATE MATERIALIZED VIEW jwl.metal_mix AS
+SELECT date_trunc('month', ts)::date AS month,
+       metal_type, metal_color, metal_fineness,
+       SUM(qty) AS units, SUM(net_revenue) AS revenue
+FROM jwl.txn_quality_enriched
+GROUP BY 1,2,3,4
+WITH DATA;
+
+-- ==========================================
+-- [J] CUSTOMER / TICKET KPIs (optional)
+-- ==========================================
+CREATE MATERIALIZED VIEW jwl.ticket_kpis AS
+SELECT 
+  date_trunc('day', ts)::date AS d,
+  store_id,
+  COUNT(DISTINCT tx_id) AS tickets,
+  SUM(net_revenue)      AS revenue,
+  SUM(qty)              AS units,
+  (SUM(net_revenue)/NULLIF(COUNT(DISTINCT tx_id),0)) AS avg_ticket
+FROM jwl.txn
+GROUP BY 1,2
+WITH DATA;
+
+-- ==========================================
+-- [K] EXEC DASHBOARD VIEW
+-- ==========================================
+CREATE OR REPLACE VIEW jwl.exec_dashboard AS
+SELECT 
+  c.m0 AS month,
+  vs.store_id,
+  vs.gem_species, vs.gem_variety,
+  vs.units, vs.revenue,
+  pl.lift_units,
+  vc.skus_on_hand,
+  mm.metal_type, mm.metal_color, mm.metal_fineness,
+  tk.tickets, tk.avg_ticket
+FROM jwl.variety_sales vs
+JOIN jwl.cal c ON c.m0 = vs.month
+LEFT JOIN (
+  SELECT date_trunc('month', d)::date AS month, store_id, SUM(lift_units) AS lift_units
+  FROM jwl.promo_lift
+  GROUP BY 1,2
+) pl ON pl.month = vs.month AND pl.store_id = vs.store_id
+LEFT JOIN jwl.variety_coverage vc 
+  ON vc.gem_species=vs.gem_species AND vc.gem_variety=vs.gem_variety AND vc.store_id=vs.store_id
+LEFT JOIN jwl.metal_mix mm ON mm.month=vs.month
+LEFT JOIN (
+  SELECT date_trunc('month', d)::date AS month, store_id, SUM(tickets) AS tickets, AVG(avg_ticket) AS avg_ticket
+  FROM jwl.ticket_kpis GROUP BY 1,2
+) tk ON tk.month=vs.month AND tk.store_id=vs.store_id;
+
+-- Indices for the dashboard
+CREATE INDEX IF NOT EXISTS exec_dash_idx ON jwl.exec_dashboard(month, store_id, gem_species, gem_variety);
