@@ -1,0 +1,71 @@
+WITH base_data AS (
+    SELECT 
+        b.branch_id,
+        b.branch_name,
+        p.product_type, -- 'CASA', 'Loan', 'Time Deposit', etc.
+        a.account_id,
+        DATE_TRUNC('month', t.transaction_date) AS month,
+        
+        -- Transaction metrics
+        SUM(t.amount) AS total_amount,
+        SUM(CASE WHEN p.product_type = 'Loan' AND t.transaction_type = 'Payment' THEN t.amount ELSE 0 END) AS total_loan_payments,
+        SUM(CASE WHEN p.product_type = 'Loan' AND t.transaction_type = 'Release' THEN t.amount ELSE 0 END) AS total_loan_releases,
+        
+        -- Balances
+        MAX(t.balance_after) AS month_end_balance,
+        
+        -- CASA balances
+        SUM(CASE WHEN p.product_type = 'CASA' THEN t.balance_after ELSE 0 END) AS casa_balance
+        
+    FROM branches b
+    JOIN accounts a ON b.branch_id = a.branch_id
+    JOIN products p ON a.product_id = p.product_id
+    JOIN transactions t ON a.account_id = t.account_id
+    WHERE t.transaction_date BETWEEN DATE_TRUNC('year', CURRENT_DATE) AND CURRENT_DATE
+    GROUP BY b.branch_id, b.branch_name, p.product_type, a.account_id, DATE_TRUNC('month', t.transaction_date)
+),
+
+sl_gl_recon AS (
+    SELECT 
+        sl.account_id,
+        (sl.sl_balance - gl.gl_balance) AS difference
+    FROM sub_ledger sl
+    JOIN general_ledger gl ON sl.account_id = gl.account_id
+    WHERE ABS(sl.sl_balance - gl.gl_balance) > 0.01
+),
+
+branch_targets AS (
+    SELECT 
+        branch_id,
+        product_type,
+        budget_amount
+    FROM budgets
+    WHERE budget_year = EXTRACT(YEAR FROM CURRENT_DATE)
+)
+
+SELECT 
+    bd.branch_name,
+    bd.product_type,
+    bd.month,
+    
+    COUNT(DISTINCT bd.account_id) AS active_accounts,
+    SUM(bd.total_amount) AS total_transaction_amount,
+    SUM(bd.total_loan_payments) AS total_loan_payments,
+    SUM(bd.total_loan_releases) AS total_loan_releases,
+    SUM(bd.casa_balance) AS total_casa_balance,
+    SUM(bd.month_end_balance) AS total_month_end_balance,
+    
+    -- Budget variance
+    bt.budget_amount,
+    (SUM(bd.total_amount) - COALESCE(bt.budget_amount, 0)) AS variance_to_budget,
+    
+    -- Reconciliation issues
+    COUNT(DISTINCT sr.account_id) AS accounts_with_recon_issues
+    
+FROM base_data bd
+LEFT JOIN branch_targets bt 
+    ON bd.branch_id = bt.branch_id AND bd.product_type = bt.product_type
+LEFT JOIN sl_gl_recon sr 
+    ON bd.account_id = sr.account_id
+GROUP BY bd.branch_name, bd.product_type, bd.month, bt.budget_amount
+ORDER BY bd.month DESC, bd.branch_name;
