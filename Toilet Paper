@@ -1,0 +1,466 @@
+/* =============================================================================
+   UNIFIED CPG ANALYTICS — TOILET PAPER (ONE SCRIPT)
+   Dialect : PostgreSQL 14+
+   Schema  : marts
+   Purpose : End-to-end analytics: sell-in/out, OSA, ND/WD, baseline vs incremental,
+             GTN waterfall, promo ROI, price-pack, simulation, growth.
+   Labeling: [A#]=Core pipeline, [B#]=Dashboards, [C#]=OSA/OOS, [D#]=GTN,
+             [E#]=Promo ROI, [F#]=PPA, [G#]=Distribution, [H#]=Simulation,
+             [I#]=Growth, [J#]=Ops.
+   ============================================================================= */
+
+-- Bootstrap schema
+CREATE SCHEMA IF NOT EXISTS marts;
+
+-- [A0] Parameters (scope + scenario knobs) -----------------------------------
+CREATE OR REPLACE VIEW marts.tp_params AS
+SELECT
+  DATE '2025-04-01'::date AS start_date,
+  (CURRENT_DATE)::date    AS end_date,
+  'Toilet Paper'          AS category_filter,
+  'P&G'                   AS brand_filter,
+  NULL::text              AS region_filter,          -- e.g., 'Luzon' to gate by region
+  1.00::numeric           AS sim_price_factor,       -- price scale factor
+  1.00::numeric           AS sim_promo_uplift_factor,-- promo response scale
+  0.90::numeric           AS sim_cannibalization;    -- keep % of uplift after cannibalization
+
+-- [A1] Canonical calendar (day/week/month) -----------------------------------
+CREATE OR REPLACE VIEW marts.d_calendar AS
+WITH p AS (SELECT * FROM marts.tp_params)
+SELECT g::date AS dte,
+       DATE_TRUNC('week', g)::date  AS wk,
+       DATE_TRUNC('month', g)::date AS ym
+FROM p
+CROSS JOIN GENERATE_SERIES(p.start_date, p.end_date, INTERVAL '1 day') g;
+
+-- [A2] SKU scope (brand/category filter) -------------------------------------
+CREATE OR REPLACE VIEW marts.scoped_skus AS
+WITH p AS (SELECT * FROM marts.tp_params)
+SELECT pr.*
+FROM products pr, p
+WHERE pr.category = p.category_filter
+  AND pr.brand    = p.brand_filter;
+
+-- [A3] Pack factors (normalize size) -----------------------------------------
+CREATE OR REPLACE VIEW marts.pack_factors AS
+SELECT
+  sku_id,
+  GREATEST(pack_size_rolls,1)                  AS rolls_per_pack,
+  GREATEST(sheets_per_roll,1)                  AS sheets_per_roll,
+  (GREATEST(pack_size_rolls,1)*GREATEST(sheets_per_roll,1))::numeric AS sheets_per_pack
+FROM marts.scoped_skus;
+
+-- [A4] Weekly price list ------------------------------------------------------
+CREATE OR REPLACE VIEW marts.price_list_wk AS
+SELECT DISTINCT ON (pl.sku_id, DATE_TRUNC('week', c.dte))
+       pl.sku_id,
+       DATE_TRUNC('week', c.dte)::date AS wk,
+       pl.list_price
+FROM price_list pl
+JOIN marts.scoped_skus k USING (sku_id)
+JOIN marts.d_calendar c ON c.dte >= pl.effective_date
+ORDER BY pl.sku_id, DATE_TRUNC('week', c.dte), pl.effective_date DESC;
+
+-- [A5] Sell-in (weekly) -------------------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.sell_in_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.sell_in_wk AS
+WITH p AS (SELECT * FROM marts.tp_params)
+SELECT
+  s.sku_id,
+  DATE_TRUNC('week', s.ship_date)::date AS wk,
+  s.customer_id,
+  SUM(s.units)       AS si_units,
+  SUM(s.gross_value) AS si_gross_value
+FROM shipments s
+JOIN marts.scoped_skus k USING (sku_id)
+JOIN p ON s.ship_date BETWEEN p.start_date AND p.end_date
+GROUP BY s.sku_id, DATE_TRUNC('week', s.ship_date), s.customer_id;
+CREATE INDEX IF NOT EXISTS ix_sell_in_wk ON marts.sell_in_wk (wk, sku_id);
+
+-- [A6] Sell-out POS (weekly, with flags) -------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.sell_out_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.sell_out_wk AS
+WITH p AS (SELECT * FROM marts.tp_params)
+SELECT
+  ps.sku_id,
+  DATE_TRUNC('week', ps.pos_date)::date AS wk,
+  st.store_id,
+  st.region,
+  st.channel,
+  COALESCE(SUM(ps.units), 0)        AS so_units,
+  COALESCE(SUM(ps.net_value), 0)    AS so_net_value,
+  AVG(NULLIF(ps.reg_price,0))       AS avg_reg_price,
+  AVG(NULLIF(ps.promo_price,0))     AS avg_promo_price,
+  MAX(CASE WHEN ps.feature_flag THEN 1 ELSE 0 END) AS any_feature,
+  MAX(CASE WHEN ps.display_flag THEN 1 ELSE 0 END) AS any_display
+FROM pos ps
+JOIN marts.scoped_skus k USING (sku_id)
+JOIN stores st USING (store_id)
+JOIN p ON ps.pos_date BETWEEN p.start_date AND p.end_date
+      AND (p.region_filter IS NULL OR st.region = p.region_filter)
+GROUP BY ps.sku_id, DATE_TRUNC('week', ps.pos_date), st.store_id, st.region, st.channel;
+CREATE INDEX IF NOT EXISTS ix_sell_out_wk ON marts.sell_out_wk (wk, sku_id, store_id);
+
+-- [A7] Promo calendar (weekly) -----------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.promo_calendar_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.promo_calendar_wk AS
+SELECT
+  pr.sku_id,
+  pr.store_id,
+  DATE_TRUNC('week', g.dte)::date AS wk,
+  MAX(pr.promo_type)   AS promo_type,
+  MAX(pr.discount_rate) AS discount_rate
+FROM promos pr
+JOIN marts.scoped_skus k USING (sku_id)
+JOIN marts.d_calendar g ON g.dte BETWEEN pr.start_date AND pr.end_date
+GROUP BY pr.sku_id, pr.store_id, DATE_TRUNC('week', g.dte);
+CREATE INDEX IF NOT EXISTS ix_promo_calendar_wk ON marts.promo_calendar_wk (wk, sku_id, store_id);
+
+-- [A8] Inventory (weekly) -----------------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.inventory_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.inventory_wk AS
+WITH p AS (SELECT * FROM marts.tp_params)
+SELECT
+  i.sku_id,
+  COALESCE(i.location_id, -1)            AS location_id,
+  i.loc_type,                             -- 'STORE' or 'DC'
+  DATE_TRUNC('week', i.inv_date)::date AS wk,
+  SUM(i.units_on_hand) AS eow_units
+FROM inventory i
+JOIN marts.scoped_skus k USING (sku_id)
+JOIN p ON i.inv_date BETWEEN p.start_date AND p.end_date
+GROUP BY i.sku_id, COALESCE(i.location_id,-1), i.loc_type, DATE_TRUNC('week', i.inv_date);
+CREATE INDEX IF NOT EXISTS ix_inventory_wk ON marts.inventory_wk (wk, sku_id, loc_type, location_id);
+
+-- [A9] Distribution ND/WD (weekly) -------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.nd_wd_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.nd_wd_wk AS
+WITH carried AS (
+  SELECT so.sku_id, so.wk, so.store_id
+  FROM marts.sell_out_wk so
+  WHERE so.so_units > 0
+  GROUP BY so.sku_id, so.wk, so.store_id
+),
+base AS (
+  SELECT
+    c.sku_id,
+    c.wk,
+    COUNT(DISTINCT c.store_id)::numeric                       AS stores_carrying,
+    (SELECT COUNT(*)::numeric FROM stores)                    AS stores_total,
+    COALESCE(SUM(st.store_weight),0)::numeric                 AS wd_numer,
+    COALESCE((SELECT SUM(store_weight) FROM stores),0)::numeric AS wd_denom
+  FROM carried c
+  JOIN stores st ON st.store_id = c.store_id
+  GROUP BY c.sku_id, c.wk
+)
+SELECT
+  sku_id, wk,
+  CASE WHEN stores_total=0 THEN 0 ELSE stores_carrying / stores_total END AS nd,
+  CASE WHEN wd_denom=0 THEN 0 ELSE wd_numer / wd_denom END               AS wd
+FROM base;
+CREATE INDEX IF NOT EXISTS ix_nd_wd_wk ON marts.nd_wd_wk (wk, sku_id);
+
+-- [A10] Baseline estimate (moving-median on clean weeks) ---------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.baseline_est_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.baseline_est_wk AS
+WITH flags AS (
+  SELECT
+    so.sku_id, so.store_id, so.wk, so.so_units,
+    COALESCE(pc.discount_rate,0) AS disc,
+    COALESCE(pc.promo_type,'NONE') AS promo_type,
+    GREATEST(so.any_feature,0) AS ftr, GREATEST(so.any_display,0) AS dsp
+  FROM marts.sell_out_wk so
+  LEFT JOIN marts.promo_calendar_wk pc
+    ON pc.sku_id = so.sku_id AND pc.store_id = so.store_id AND pc.wk = so.wk
+),
+nonpromo AS (
+  SELECT *,
+         CASE WHEN (disc <= 0.05 AND ftr=0 AND dsp=0 AND promo_type='NONE') THEN 1 ELSE 0 END AS is_clean
+  FROM flags
+)
+SELECT
+  n1.sku_id, n1.store_id, n1.wk,
+  PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n2.so_units) AS baseline_units
+FROM nonpromo n1
+JOIN nonpromo n2
+  ON n2.sku_id = n1.sku_id
+ AND n2.store_id = n1.store_id
+ AND n2.is_clean = 1
+ AND n2.wk BETWEEN (n1.wk - INTERVAL '16 weeks') AND (n1.wk - INTERVAL '1 week')
+GROUP BY n1.sku_id, n1.store_id, n1.wk;
+CREATE INDEX IF NOT EXISTS ix_baseline_est_wk ON marts.baseline_est_wk (wk, sku_id, store_id);
+
+-- [A11] Store-level weekly KPIs ----------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.kpi_wk_store CASCADE;
+CREATE MATERIALIZED VIEW marts.kpi_wk_store AS
+SELECT
+  so.sku_id, so.store_id, so.wk, so.region, so.channel,
+  so.so_units,
+  so.so_net_value,
+  COALESCE(be.baseline_units, 0) AS baseline_units,
+  GREATEST(so.so_units - COALESCE(be.baseline_units,0), 0) AS incr_units,
+  CASE WHEN COALESCE(be.baseline_units,0)=0 THEN NULL
+       ELSE (so.so_units / NULLIF(be.baseline_units,0) - 1) END AS uplift_index,
+  COALESCE(pc.discount_rate,0) AS discount_rate,
+  COALESCE(pc.promo_type,'NONE') AS promo_type
+FROM marts.sell_out_wk so
+LEFT JOIN marts.baseline_est_wk be
+  ON be.sku_id = so.sku_id AND be.store_id = so.store_id AND be.wk = so.wk
+LEFT JOIN marts.promo_calendar_wk pc
+  ON pc.sku_id = so.sku_id AND pc.store_id = so.store_id AND pc.wk = so.wk;
+CREATE INDEX IF NOT EXISTS ix_kpi_wk_store ON marts.kpi_wk_store (wk, sku_id, store_id);
+
+-- [A12] SKU-level weekly KPIs -------------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.kpi_wk_sku CASCADE;
+CREATE MATERIALIZED VIEW marts.kpi_wk_sku AS
+SELECT
+  s.sku_id, s.wk,
+  SUM(s.so_units)               AS so_units,
+  SUM(s.so_net_value)           AS so_net_value,
+  SUM(s.baseline_units)         AS baseline_units,
+  SUM(s.incr_units)             AS incr_units,
+  AVG(NULLIF(s.uplift_index,0)) AS avg_uplift_index,
+  AVG(s.discount_rate)          AS avg_discount_rate
+FROM marts.kpi_wk_store s
+GROUP BY s.sku_id, s.wk;
+CREATE INDEX IF NOT EXISTS ix_kpi_wk_sku ON marts.kpi_wk_sku (wk, sku_id);
+
+-- [A13] GTN components (weekly) ----------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.gtn_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.gtn_wk AS
+SELECT
+  k.sku_id, k.wk,
+  pl.list_price,
+  GREATEST(pl.list_price - NULLIF((k.so_net_value / NULLIF(k.so_units,0)), 0), 0) AS invoice_discount_per_unit,
+  COALESCE(ts.spend_amt_per_unit, 0) AS trade_spend_per_unit
+FROM marts.kpi_wk_sku k
+LEFT JOIN marts.price_list_wk pl
+  ON pl.sku_id = k.sku_id AND pl.wk = k.wk
+LEFT JOIN (
+   SELECT pr.sku_id, DATE_TRUNC('week', g.dte)::date AS wk,
+          SUM(t.amount) / NULLIF(SUM(p.units),0)     AS spend_amt_per_unit
+   FROM trade_spend t
+   JOIN promos pr ON pr.fund_id = t.fund_id
+   JOIN marts.d_calendar g ON g.dte BETWEEN pr.start_date AND pr.end_date
+   JOIN pos p ON p.sku_id = pr.sku_id AND p.pos_date = g.dte
+   GROUP BY pr.sku_id, DATE_TRUNC('week', g.dte)
+) ts ON ts.sku_id = k.sku_id AND ts.wk = k.wk;
+CREATE INDEX IF NOT EXISTS ix_gtn_wk ON marts.gtn_wk (wk, sku_id);
+
+-- [A14] FINAL unified weekly SKU table ---------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.final_wk_sku CASCADE;
+CREATE MATERIALIZED VIEW marts.final_wk_sku AS
+SELECT
+  k.sku_id, k.wk,
+  k.so_units, k.so_net_value,
+  k.baseline_units, k.incr_units, k.avg_uplift_index, k.avg_discount_rate,
+  si.si_units, si.si_gross_value,
+  inv_dc.eow_units AS dc_eow_units,
+  nd.nd, nd.wd,
+  pl.list_price,
+  gtn.invoice_discount_per_unit,
+  gtn.trade_spend_per_unit,
+  pf.sheets_per_pack,
+  (k.so_net_value / NULLIF(k.so_units,0))                                               AS net_price_per_unit,
+  ((k.so_net_value / NULLIF(k.so_units,0)) / NULLIF(pf.sheets_per_pack,0) * 100.0)      AS price_per_100_sheets
+FROM marts.kpi_wk_sku k
+LEFT JOIN marts.sell_in_wk     si    ON si.sku_id = k.sku_id AND si.wk = k.wk
+LEFT JOIN marts.inventory_wk   inv_dc ON inv_dc.sku_id = k.sku_id AND inv_dc.wk = k.wk AND inv_dc.loc_type='DC'
+LEFT JOIN marts.nd_wd_wk       nd    ON nd.sku_id = k.sku_id AND nd.wk = k.wk
+LEFT JOIN marts.price_list_wk  pl    ON pl.sku_id = k.sku_id AND pl.wk = k.wk
+LEFT JOIN marts.gtn_wk         gtn   ON gtn.sku_id = k.sku_id AND gtn.wk = k.wk
+LEFT JOIN marts.pack_factors   pf    USING (sku_id);
+CREATE INDEX IF NOT EXISTS ix_final_wk_sku ON marts.final_wk_sku (wk, sku_id);
+
+-- [B1] Brand-week dashboard ---------------------------------------------------
+DROP MATERIALIZED VIEW IF EXISTS marts.tp_brand_wk CASCADE;
+CREATE MATERIALIZED VIEW marts.tp_brand_wk AS
+SELECT
+  DATE_TRUNC('week', wk)::date AS wk,
+  SUM(so_units)         AS so_units,
+  SUM(so_net_value)     AS so_net_sales,
+  SUM(baseline_units)   AS baseline_units,
+  SUM(incr_units)       AS incr_units,
+  AVG(avg_uplift_index) AS avg_uplift,
+  AVG(nd)               AS avg_nd,
+  AVG(wd)               AS avg_wd,
+  SUM(si_units)         AS si_units,
+  SUM(dc_eow_units)     AS dc_eow_units
+FROM marts.final_wk_sku
+GROUP BY DATE_TRUNC('week', wk);
+CREATE INDEX IF NOT EXISTS ix_tp_brand_wk ON marts.tp_brand_wk (wk);
+
+-- [C1] OSA/OOS + WOS by region/channel ---------------------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_osa_wos AS
+WITH so AS (
+  SELECT sku_id, store_id, DATE_TRUNC('week', pos_date)::date AS wk, SUM(units) AS units
+  FROM pos
+  WHERE pos_date >= (SELECT start_date FROM marts.tp_params)
+  GROUP BY sku_id, store_id, DATE_TRUNC('week', pos_date)
+),
+inv AS (
+  SELECT sku_id, location_id AS store_id, DATE_TRUNC('week', inv_date)::date AS wk, SUM(units_on_hand) AS eow
+  FROM inventory
+  WHERE loc_type='STORE' AND inv_date >= (SELECT start_date FROM marts.tp_params)
+  GROUP BY sku_id, location_id, DATE_TRUNC('week', inv_date)
+)
+SELECT
+  st.region, st.channel, so.wk,
+  SUM(CASE WHEN COALESCE(inv.eow,0)=0 AND so.units=0 THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*),0)  AS oos_rate,
+  AVG( inv.eow / NULLIF(so.units,0) ) AS weeks_of_supply_est
+FROM so
+LEFT JOIN inv ON inv.sku_id=so.sku_id AND inv.store_id=so.store_id AND inv.wk=so.wk
+JOIN stores st ON st.store_id = so.store_id
+GROUP BY st.region, st.channel, so.wk;
+
+-- [C2] OSA flags (store×sku×week) -------------------------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_osa_flags AS
+WITH so AS (
+  SELECT sku_id, store_id, DATE_TRUNC('week', pos_date)::date AS wk, SUM(units) AS units
+  FROM pos
+  WHERE pos_date BETWEEN (SELECT start_date FROM marts.tp_params) AND (SELECT end_date FROM marts.tp_params)
+  GROUP BY sku_id, store_id, DATE_TRUNC('week', pos_date)
+),
+inv AS (
+  SELECT sku_id, location_id AS store_id, DATE_TRUNC('week', inv_date)::date AS wk, SUM(units_on_hand) AS eow
+  FROM inventory
+  WHERE loc_type='STORE'
+    AND inv_date BETWEEN (SELECT start_date FROM marts.tp_params) AND (SELECT end_date FROM marts.tp_params)
+  GROUP BY sku_id, location_id, DATE_TRUNC('week', inv_date)
+)
+SELECT
+  so.sku_id, so.store_id, so.wk,
+  CASE
+    WHEN COALESCE(inv.eow,0)=0 AND so.units>0 THEN 'Phantom inventory'
+    WHEN COALESCE(inv.eow,0)=0 AND so.units=0 THEN 'Hard OOS'
+    ELSE 'OK'
+  END AS osa_flag
+FROM so
+LEFT JOIN inv ON inv.sku_id=so.sku_id AND inv.store_id=so.store_id AND inv.wk=so.wk;
+
+-- [D1] GTN waterfall (per SKU×week) ------------------------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_gtn AS
+SELECT
+  f.wk, f.sku_id,
+  f.list_price,
+  f.net_price_per_unit,
+  f.invoice_discount_per_unit,
+  f.trade_spend_per_unit,
+  (f.list_price - f.invoice_discount_per_unit - f.trade_spend_per_unit) AS net_realization
+FROM marts.final_wk_sku f;
+
+-- [E1] Promo ROI & efficiency -------------------------------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_promo_roi AS
+WITH promo_weeks AS (
+  SELECT k.*, (k.incr_units * k.net_price_per_unit) AS incr_revenue
+  FROM marts.final_wk_sku k
+  WHERE k.avg_discount_rate > 0.05
+),
+trade_cost AS (
+  SELECT sku_id, wk, SUM(trade_spend_per_unit * so_units) AS trade_cost
+  FROM marts.final_wk_sku
+  GROUP BY sku_id, wk
+)
+SELECT
+  p.wk, p.sku_id,
+  p.incr_units, p.incr_revenue,
+  t.trade_cost,
+  CASE WHEN COALESCE(t.trade_cost,0)=0 THEN NULL ELSE p.incr_revenue / t.trade_cost END AS promo_roi
+FROM promo_weeks p
+LEFT JOIN trade_cost t ON t.sku_id = p.sku_id AND t.wk = p.wk;
+
+-- [F1] Price-Pack Architecture (per 100 sheets / per roll) -------------------
+CREATE OR REPLACE VIEW marts.vw_tp_ppa AS
+SELECT
+  f.wk, f.sku_id,
+  f.price_per_100_sheets,
+  (f.net_price_per_unit / NULLIF(pf.rolls_per_pack,0)) AS price_per_roll,
+  f.net_price_per_unit AS price_per_pack
+FROM marts.final_wk_sku f
+JOIN marts.pack_factors pf USING (sku_id);
+
+-- [G1] ND/WD rollup (brand-week) ---------------------------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_distribution AS
+SELECT
+  wk,
+  AVG(nd) AS avg_nd,
+  AVG(wd) AS avg_wd,
+  SUM(so_units) AS units,
+  SUM(so_net_value) AS sales
+FROM marts.final_wk_sku
+GROUP BY wk;
+
+-- [H1] Scenario simulation (price & promo response) --------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_sim AS
+WITH p AS (SELECT * FROM marts.tp_params),
+sim AS (
+  SELECT
+    f.wk, f.sku_id,
+    (f.net_price_per_unit * p.sim_price_factor) AS sim_net_price,
+    f.baseline_units,
+    f.incr_units,
+    p.sim_promo_uplift_factor AS ufac,
+    p.sim_cannibalization     AS cann
+  FROM marts.final_wk_sku f, p
+)
+SELECT
+  wk, sku_id,
+  sim_net_price,
+  baseline_units + (incr_units * ufac * cann)                           AS sim_units,
+  (baseline_units + (incr_units * ufac * cann)) * sim_net_price         AS sim_revenue
+FROM sim;
+
+-- [I1] Growth decomposition (MoM Price vs Volume) ----------------------------
+CREATE OR REPLACE VIEW marts.vw_tp_growth_mom AS
+WITH brand_month AS (
+  SELECT
+    DATE_TRUNC('month', wk)::date AS ym,
+    SUM(so_units)                              AS units,
+    SUM(so_net_value)                          AS value,
+    SUM(so_net_value)/NULLIF(SUM(so_units),0)  AS avg_price
+  FROM marts.final_wk_sku
+  GROUP BY DATE_TRUNC('month', wk)
+),
+lagged AS (
+  SELECT
+    ym, units, value, avg_price,
+    LAG(units) OVER (ORDER BY ym)     AS units_prev,
+    LAG(value) OVER (ORDER BY ym)     AS value_prev,
+    LAG(avg_price) OVER (ORDER BY ym) AS price_prev
+  FROM brand_month
+)
+SELECT
+  ym,
+  (value - value_prev)                                            AS delta_value,
+  (avg_price - price_prev) * COALESCE(units_prev,0)               AS price_effect,
+  0::numeric                                                      AS mix_effect,   -- extend at SKU level if needed
+  price_prev * (units - COALESCE(units_prev,0))                   AS volume_effect
+FROM lagged
+WHERE value_prev IS NOT NULL
+ORDER BY ym;
+
+-- [J1] Operational hardening (indexes on MVs) --------------------------------
+CREATE INDEX IF NOT EXISTS ix_mv_brand_wk      ON marts.tp_brand_wk (wk);
+CREATE INDEX IF NOT EXISTS ix_mv_final_price   ON marts.final_wk_sku (sku_id, wk);
+CREATE INDEX IF NOT EXISTS ix_mv_gtn_price     ON marts.vw_tp_gtn (wk, sku_id);
+-- Base-table sargability (idempotent)
+CREATE INDEX IF NOT EXISTS ix_pos_sku_date       ON pos (sku_id, pos_date);
+CREATE INDEX IF NOT EXISTS ix_pos_store_date     ON pos (store_id, pos_date);
+CREATE INDEX IF NOT EXISTS ix_shipments_sku_date ON shipments (sku_id, ship_date);
+CREATE INDEX IF NOT EXISTS ix_inv_loc_date       ON inventory (location_id, inv_date);
+CREATE INDEX IF NOT EXISTS ix_promos_sku_store   ON promos (sku_id, store_id, start_date, end_date);
+CREATE INDEX IF NOT EXISTS ix_trade_spend_fund   ON trade_spend (fund_id, spend_date);
+CREATE INDEX IF NOT EXISTS ix_price_list_eff     ON price_list (sku_id, effective_date);
+
+-- ============================== DONE ========================================
+-- Primary consumption tables/views:
+--   marts.final_wk_sku       -> golden weekly SKU KPIs (all metrics unified)
+--   marts.tp_brand_wk        -> weekly brand rollup
+--   marts.vw_tp_osa_wos      -> OSA & WOS by region/channel
+--   marts.vw_tp_osa_flags    -> Hard OOS / Phantom inventory flags
+--   marts.vw_tp_gtn          -> GTN waterfall
+--   marts.vw_tp_promo_roi    -> incremental revenue vs trade cost (ROI)
+--   marts.vw_tp_ppa          -> price-pack architecture (per 100 sheets)
+--   marts.vw_tp_distribution -> ND/WD & sales trend
+--   marts.vw_tp_sim          -> scenario simulations
+--   marts.vw_tp_growth_mom   -> price vs volume decomposition (MoM)
